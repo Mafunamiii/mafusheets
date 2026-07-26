@@ -1,5 +1,5 @@
 const express = require("express");
-const rateLimit = require("express-rate-limit");
+const { rateLimit } = require("express-rate-limit");
 const multer = require("multer");
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -10,6 +10,13 @@ const { promisify } = require("util");
 const { extractSearchText, normalizeSearchText } = require("./search-indexer");
 const { createCatalogStore, migrateLegacyCatalog, openDatabase } = require("./lib/database");
 const { createUserStore } = require("./lib/users");
+const {
+  SESSION_TTL_MS,
+  auditEvent,
+  createSessionStore,
+  digest,
+  requireSessionSecret
+} = require("./lib/security");
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -55,26 +62,38 @@ const DATA_DIR = path.join(ROOT, "data");
 const UPLOADS_DIR = path.join(ROOT, "uploads");
 const TMP_DIR = path.join(ROOT, ".tmp");
 const THUMB_DIR = path.join(DATA_DIR, "thumbnails");
-const INDEX_FILE = path.join(DATA_DIR, "resources.json");
+const INDEX_FILE = process.env.LEGACY_CATALOG_PATH || path.join(DATA_DIR, "resources.json");
 const DATABASE_FILE = process.env.DATABASE_PATH || path.join(DATA_DIR, "mafusheets.sqlite");
 const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || (process.platform === "win32" ? "pdftoppm.cmd" : "pdftoppm");
 const MAX_FILE_SIZE = 250 * 1024 * 1024;
 const MAX_FILES_PER_UPLOAD = 10;
-const DELETE_CODE = process.env.DELETE_CODE || "";
 const SESSION_COOKIE = "mafusheets_admin";
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
+const SESSION_SECRET = requireSessionSecret(process.env.SESSION_SECRET);
 let indexQueue = Promise.resolve();
 let database;
 let catalogStore;
 let userStore;
-const sessions = new Map();
+let sessionStore;
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  keyGenerator: (req) => {
+    const login = String(req.body && req.body.username || "").trim().toLowerCase();
+    return `${digest(SESSION_SECRET, req.ip || "").slice(0, 16)}:${digest(SESSION_SECRET, login).slice(0, 16)}`;
+  },
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many login attempts. Please wait a bit and try again." }
+  handler: (req, res) => {
+    if (database) {
+      auditEvent(database, {
+        eventType: "login_rejected",
+        entityType: "session",
+        details: auditDetails(req, { reason: "rate_limited" })
+      });
+    }
+    res.status(429).json({ error: "Too many login attempts. Please wait and try again." });
+  }
 });
 
 const uploadKinds = {
@@ -136,6 +155,7 @@ const uploadLimiter = rateLimit({
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
+const allowPublic = (_req, _res, next) => next();
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
@@ -149,15 +169,15 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/assets/logo.png", (_req, res) => {
+app.get("/assets/logo.png", allowPublic, (_req, res) => {
   res.type("png").sendFile(path.join(ROOT, "logo.png"));
 });
 
-app.get("/favicon.ico", (_req, res) => {
+app.get("/favicon.ico", allowPublic, (_req, res) => {
   res.type("png").sendFile(path.join(ROOT, "logo.png"));
 });
 
-app.get("/assets/banner.png", (_req, res) => {
+app.get("/assets/banner.png", allowPublic, (_req, res) => {
   res.type("png").sendFile(path.join(ROOT, "Banner.png"));
 });
 
@@ -175,6 +195,8 @@ async function ensureStorage() {
   await migrateLegacyCatalog(database, INDEX_FILE);
   catalogStore = createCatalogStore(database);
   userStore = createUserStore(database);
+  sessionStore = createSessionStore(database, SESSION_SECRET);
+  sessionStore.purgeExpired();
 }
 
 function parseCookies(req) {
@@ -193,7 +215,11 @@ function parseCookies(req) {
       continue;
     }
 
-    cookies[name] = decodeURIComponent(value);
+    try {
+      cookies[name] = decodeURIComponent(value);
+    } catch {
+      cookies[name] = "";
+    }
   }
 
   return cookies;
@@ -227,41 +253,9 @@ function verifyCookieValue(value) {
   return token;
 }
 
-function cleanupExpiredSessions() {
-  const now = Date.now();
-  for (const [token, session] of sessions.entries()) {
-    if (!session || session.expiresAt <= now) {
-      sessions.delete(token);
-    }
-  }
-}
-
 function getSession(req) {
-  cleanupExpiredSessions();
   const token = verifyCookieValue(parseCookies(req)[SESSION_COOKIE]);
-  if (!token) {
-    return null;
-  }
-
-  const session = sessions.get(token);
-  if (!session || session.expiresAt <= Date.now()) {
-    sessions.delete(token);
-    return null;
-  }
-
-  const currentUser = userStore && session.userId ? userStore.getUserById(session.userId) : null;
-  if (!currentUser || !currentUser.enabled) {
-    sessions.delete(token);
-    return null;
-  }
-
-  return {
-    token,
-    ...session,
-    user: currentUser.loginIdentifier,
-    role: currentUser.role,
-    displayName: currentUser.displayName
-  };
+  return sessionStore && token ? sessionStore.validate(token) : null;
 }
 
 function setSessionCookie(res, token) {
@@ -316,6 +310,7 @@ function isSameOrigin(req) {
 function requireAuthenticated(req, res, next) {
   const session = getSession(req);
   if (!session) {
+    auditRejected(req, "authentication_required");
     if (req.accepts("html")) {
       return res.status(401).type("html").send(renderLoginHtml());
     }
@@ -323,13 +318,24 @@ function requireAuthenticated(req, res, next) {
     return res.status(401).json({ error: "Login required." });
   }
 
+  req.auth = session;
   req.adminSession = session;
+  if (
+    session.mustChangePassword &&
+    req.path !== "/api/auth/me" &&
+    req.path !== "/api/auth/logout" &&
+    req.path !== "/api/auth/change-password"
+  ) {
+    auditRejected(req, "password_change_required");
+    return res.status(403).json({ error: "Password change required." });
+  }
   return next();
 }
 
 function requireAdmin(req, res, next) {
   return requireAuthenticated(req, res, () => {
     if (req.adminSession.role !== "admin") {
+      auditRejected(req, "administrator_required");
       return res.status(403).json({ error: "Administrator access required." });
     }
     return next();
@@ -338,6 +344,7 @@ function requireAdmin(req, res, next) {
 
 function requireSameOrigin(req, res, next) {
   if (!isSameOrigin(req)) {
+    if (database) auditRejected(req, "same_origin_required");
     return res.status(403).json({ error: "Cross-origin requests are not allowed." });
   }
 
@@ -348,7 +355,8 @@ function requireCsrf(req, res, next) {
   const session = req.adminSession || getSession(req);
   const token = String(req.get("x-csrf-token") || "");
 
-  if (!session || !token || token !== session.csrfToken) {
+  if (!session || !sessionStore.verifyCsrf(session, token)) {
+    if (database) auditRejected(req, "csrf_validation_failed");
     return res.status(403).json({ error: "Invalid security token." });
   }
 
@@ -357,26 +365,62 @@ function requireCsrf(req, res, next) {
 }
 
 function issueSession(user) {
-  const token = crypto.randomBytes(32).toString("hex");
-  const csrfToken = crypto.randomBytes(32).toString("hex");
-  const expiresAt = Date.now() + SESSION_TTL_MS;
-  sessions.set(token, {
-    user: user.loginIdentifier,
-    userId: user.id,
-    role: user.role,
-    displayName: user.displayName,
-    csrfToken,
-    expiresAt
-  });
-  return { token, csrfToken, expiresAt, ...sessions.get(token) };
+  return { ...sessionStore.issue(user.id), user: user.loginIdentifier, userId: user.id, role: user.role };
 }
 
 function revokeSession(token) {
-  sessions.delete(token);
+  sessionStore.revoke(token);
 }
 
-function isAuthenticated(req) {
-  return Boolean(getSession(req));
+function auditDetails(req, details = {}) {
+  const forwarded = String(req.ip || req.socket.remoteAddress || "");
+  return {
+    ...details,
+    clientFingerprint: forwarded ? digest(SESSION_SECRET, forwarded).slice(0, 16) : undefined
+  };
+}
+
+function recordAudit(req, eventType, entityType, entityId, details = {}) {
+  auditEvent(database, {
+    actorUserId: req.adminSession ? req.adminSession.userId : null,
+    eventType,
+    entityType,
+    entityId,
+    details: auditDetails(req, details)
+  });
+}
+
+function auditRejected(req, reason, entityType = "route", entityId = null) {
+  recordAudit(req, "authorization_rejected", entityType, entityId, {
+    reason,
+    method: req.method,
+    path: req.route ? req.route.path : req.path
+  });
+}
+
+async function requireResourceEditor(req, res, next) {
+  const resources = await readIndex();
+  const resource = getResourceById(resources, req.params.id);
+  if (!resource) return res.status(404).json({ error: "Sheet not found." });
+  if (req.adminSession.role !== "admin" && resource.uploadedBy !== req.adminSession.userId) {
+    auditRejected(req, "resource_owner_required", "resource", resource.id);
+    return res.status(403).json({ error: "You cannot modify this resource." });
+  }
+  req.authorizedResource = resource;
+  return next();
+}
+
+async function requireAnnotationOwner(req, res, next) {
+  const resources = await readIndex();
+  const resource = getResourceById(resources, req.params.id);
+  const annotation = resource && (resource.annotations || [])
+    .find((item) => item.id === req.params.annotationId);
+  if (!resource || !annotation) return res.status(404).json({ error: "Annotation not found." });
+  if (req.adminSession.role !== "admin" && annotation.userId !== req.adminSession.userId) {
+    auditRejected(req, "annotation_owner_required", "annotation", annotation.id);
+    return res.status(403).json({ error: "You cannot modify this annotation." });
+  }
+  return next();
 }
 
 async function readIndex() {
@@ -665,7 +709,7 @@ async function removeTempFiles(files) {
   );
 }
 
-app.get("/", (req, res) => {
+app.get("/", allowPublic, (req, res) => {
   const session = getSession(req);
   if (!session) {
     return res.type("html").send(renderLoginHtml());
@@ -678,7 +722,7 @@ app.get("/", (req, res) => {
   }));
 });
 
-app.get("/login", (req, res) => {
+app.get("/login", allowPublic, (req, res) => {
   const session = getSession(req);
   if (session) {
     return res.redirect("/");
@@ -687,33 +731,72 @@ app.get("/login", (req, res) => {
   return res.type("html").send(renderLoginHtml());
 });
 
-app.get("/api/auth/me", (req, res) => {
-  const session = getSession(req);
+app.get("/health", allowPublic, (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/me", requireAuthenticated, (req, res) => {
+  const session = req.adminSession;
   res.json({
-    authenticated: Boolean(session),
-    user: session ? session.user : null,
-    role: session ? session.role : null,
-    csrfToken: session ? session.csrfToken : ""
+    authenticated: true,
+    user: session.user,
+    role: session.role,
+    mustChangePassword: session.mustChangePassword,
+    csrfToken: session.csrfToken
   });
 });
 
-app.post("/api/auth/login", authLimiter, requireSameOrigin, async (req, res) => {
-  const username = cleanText(req.body.username, 64);
+app.post("/api/auth/login", allowPublic, authLimiter, requireSameOrigin, async (req, res) => {
+  const username = cleanText(req.body.username, 128);
   const password = String(req.body.password || "");
   const user = await userStore.authenticate(username, password);
   if (!user) {
-    return res.status(403).json({ error: "Invalid credentials or disabled account." });
+    auditEvent(database, {
+      eventType: "login_rejected",
+      entityType: "session",
+      details: auditDetails(req, { loginFingerprint: digest(SESSION_SECRET, username.toLowerCase()).slice(0, 16) })
+    });
+    return res.status(401).json({ error: "Invalid credentials." });
   }
 
+  revokeSession(verifyCookieValue(parseCookies(req)[SESSION_COOKIE]));
   const session = issueSession(user);
+  auditEvent(database, {
+    actorUserId: user.id,
+    eventType: "login_succeeded",
+    entityType: "session",
+    details: auditDetails(req)
+  });
   setSessionCookie(res, session.token);
-  res.json({ ok: true, user: session.user, role: session.role, csrfToken: session.csrfToken });
+  res.json({
+    ok: true,
+    user: session.user,
+    role: session.role,
+    mustChangePassword: user.mustChangePassword,
+    csrfToken: session.csrfToken
+  });
 });
 
 app.post("/api/auth/logout", requireAuthenticated, requireSameOrigin, requireCsrf, (req, res) => {
+  recordAudit(req, "logout", "session", null);
   revokeSession(req.adminSession.token);
   clearSessionCookie(res);
   res.json({ ok: true });
+});
+
+app.post("/api/auth/change-password", requireAuthenticated, requireSameOrigin, requireCsrf, async (req, res) => {
+  try {
+    const user = await userStore.changePassword(
+      req.adminSession.userId,
+      String(req.body.currentPassword || ""),
+      String(req.body.newPassword || "")
+    );
+    const session = issueSession(user);
+    setSessionCookie(res, session.token);
+    res.json({ ok: true, csrfToken: session.csrfToken });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.get("/api/resources", requireAuthenticated, async (req, res) => {
@@ -746,7 +829,8 @@ app.get("/api/resources/:id", requireAuthenticated, async (req, res) => {
   res.json({ resource: fullResource(resource) });
 });
 
-app.patch("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
+app.patch("/api/resources/:id", requireAuthenticated, requireSameOrigin, requireCsrf, requireResourceEditor, async (req, res) => {
+  recordAudit(req, "resource_modification_requested", "resource", req.params.id, { operation: "edit" });
   const updates = {
     title: cleanText(req.body.title, 120),
     artist: cleanText(req.body.artist, 120),
@@ -776,6 +860,7 @@ app.patch("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, as
     resource.capo = capo;
     resource.bpm = bpm;
     resource.updatedAt = new Date().toISOString();
+    resource.updatedBy = req.adminSession.userId;
     return fullResource(resource);
   }, req.adminSession.userId)
     .then((result) => {
@@ -795,15 +880,7 @@ app.patch("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, as
 });
 
 app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
-  const deleteCode = String(req.body.deleteCode || "").trim();
-
-  if (!DELETE_CODE) {
-    return res.status(503).json({ error: "Resource deletion is not configured." });
-  }
-
-  if (deleteCode !== DELETE_CODE) {
-    return res.status(403).json({ error: "Invalid delete confirmation code." });
-  }
+  recordAudit(req, "resource_modification_requested", "resource", req.params.id, { operation: "delete" });
 
   let deletedResource = null;
 
@@ -831,7 +908,8 @@ app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, a
     });
 });
 
-app.post("/api/resources/:id/annotations", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
+app.post("/api/resources/:id/annotations", requireAuthenticated, requireSameOrigin, requireCsrf, async (req, res) => {
+  recordAudit(req, "resource_modification_requested", "resource", req.params.id, { operation: "annotation_create" });
   const page = cleanNumber(req.body.page, { min: 1, max: 9999 });
   const text = cleanText(req.body.text, 500);
   const color = cleanText(req.body.color, 24) || "amber";
@@ -852,6 +930,7 @@ app.post("/api/resources/:id/annotations", requireAdmin, requireSameOrigin, requ
 
     const annotation = {
       id: crypto.randomUUID(),
+      userId: req.adminSession.userId,
       page,
       text,
       color,
@@ -860,6 +939,7 @@ app.post("/api/resources/:id/annotations", requireAdmin, requireSameOrigin, requ
 
     resource.annotations.push(annotation);
     resource.updatedAt = new Date().toISOString();
+    resource.updatedBy = req.adminSession.userId;
     return annotation;
   }, req.adminSession.userId)
     .then((annotation) => {
@@ -875,7 +955,8 @@ app.post("/api/resources/:id/annotations", requireAdmin, requireSameOrigin, requ
     });
 });
 
-app.delete("/api/resources/:id/annotations/:annotationId", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
+app.delete("/api/resources/:id/annotations/:annotationId", requireAuthenticated, requireSameOrigin, requireCsrf, requireAnnotationOwner, async (req, res) => {
+  recordAudit(req, "resource_modification_requested", "annotation", req.params.annotationId, { operation: "annotation_delete" });
   await updateIndex((resources) => {
     const resource = getResourceById(resources, req.params.id);
     if (!resource) {
@@ -890,6 +971,7 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAdmin, require
 
     resource.annotations = nextAnnotations;
     resource.updatedAt = new Date().toISOString();
+    resource.updatedBy = req.adminSession.userId;
     return true;
   }, req.adminSession.userId)
     .then((result) => {
@@ -910,6 +992,7 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAdmin, require
 });
 
 app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, requireCsrf, upload.array("files", MAX_FILES_PER_UPLOAD), async (req, res) => {
+  recordAudit(req, "resource_modification_requested", "resource", null, { operation: "upload" });
   const kind = normalizeKind(req.body.kind);
   const title = cleanText(req.body.title);
   const artist = cleanText(req.body.artist, 120);
@@ -1001,7 +1084,8 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
   }
 });
 
-app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requireCsrf, async (_req, res) => {
+app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
+  recordAudit(req, "maintenance_requested", "catalog", null, { operation: "thumbnail_refresh" });
   try {
     const resources = await readIndex();
     let refreshed = 0;
@@ -1130,7 +1214,7 @@ app.use((error, _req, res, next) => {
 app.use((req, res) => {
   const session = getSession(req);
   if (!session) {
-    return res.type("html").send(renderLoginHtml());
+    return res.status(404).json({ error: "Not found." });
   }
 
   return res.status(404).type("html").send(renderMainHtml({
@@ -1580,7 +1664,6 @@ function renderReaderHtml(resourceId, { authenticated = false, csrfToken = "", u
     const annotationTextInput = document.querySelector("#annotationTextInput");
     const annotationColorInput = document.querySelector("#annotationColorInput");
     const annotationList = document.querySelector("#annotationList");
-    const deleteCode = ${JSON.stringify(DELETE_CODE)};
     let resource = null;
 
     function escapeHtml(value) {
@@ -1779,19 +1862,11 @@ function renderReaderHtml(resourceId, { authenticated = false, csrfToken = "", u
     }
 
     async function deleteResource() {
-      const confirmation = window.prompt("Type " + deleteCode + " to delete this sheet permanently.");
-      if (confirmation !== deleteCode) {
-        if (confirmation !== null) {
-          setDetailMessage("Delete cancelled. Code did not match.", "error");
-        }
-        return;
-      }
+      if (!window.confirm("Delete this sheet permanently?")) return;
 
       setDetailMessage("Deleting sheet...");
       const response = await apiFetch("/api/resources/" + encodeURIComponent(resourceId), {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deleteCode: confirmation })
+        method: "DELETE"
       });
       const result = await response.json();
 
@@ -3159,7 +3234,6 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     const annotationTextInput = document.querySelector("#annotationTextInput");
     const annotationColorInput = document.querySelector("#annotationColorInput");
     const annotationList = document.querySelector("#annotationList");
-    const deleteCode = ${JSON.stringify(DELETE_CODE)};
     const metroFlash = document.querySelector("#metroFlash");
     const metroBpm = document.querySelector("#metroBpm");
     const metroTap = document.querySelector("#metroTap");
@@ -3502,19 +3576,11 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     async function deleteResource() {
-      const confirmation = window.prompt("Type " + deleteCode + " to delete this sheet permanently.");
-      if (confirmation !== deleteCode) {
-        if (confirmation !== null) {
-          setDetailMessage("Delete cancelled. Code did not match.", "error");
-        }
-        return;
-      }
+      if (!window.confirm("Delete this sheet permanently?")) return;
 
       setDetailMessage("Deleting sheet...");
       const response = await apiFetch('/api/resources/' + encodeURIComponent(activeDetailId), {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deleteCode: confirmation })
+        method: 'DELETE'
       });
       const result = await response.json();
 

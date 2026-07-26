@@ -9,8 +9,7 @@ services:
       PORT: ${PORT:-3000}
       PDFTOPPM_BIN: ${PDFTOPPM_BIN:-pdftoppm}
       DATABASE_PATH: ${DATABASE_PATH:-/app/data/mafusheets.sqlite}
-      DELETE_CODE: ${DELETE_CODE:-}
-      SESSION_SECRET: ${SESSION_SECRET:-}
+      SESSION_SECRET: ${SESSION_SECRET:?Set a strong persistent SESSION_SECRET}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
     volumes:
       - ./data:/app/data

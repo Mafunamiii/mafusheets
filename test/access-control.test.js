@@ -1,0 +1,258 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const { spawn } = require("node:child_process");
+const fsp = require("node:fs/promises");
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+const {
+  createCatalogStore,
+  migrateLegacyCatalog,
+  openDatabase
+} = require("../lib/database");
+const { requireSessionSecret } = require("../lib/security");
+const { createUserStore } = require("../lib/users");
+
+const STRONG_SECRET = "v7Z!4mQp2#Lx9@Ks6^Nd3&Wc8*Hy5$Rt1+Ba";
+
+async function unusedPort() {
+  return new Promise((resolve, reject) => {
+    const socket = net.createServer();
+    socket.once("error", reject);
+    socket.listen(0, "127.0.0.1", () => {
+      const { port } = socket.address();
+      socket.close(() => resolve(port));
+    });
+  });
+}
+
+function cookieFrom(response) {
+  return String(response.headers.get("set-cookie") || "").split(";")[0];
+}
+
+async function login(base, username, password, cookie = "") {
+  const response = await fetch(`${base}/api/auth/login`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(cookie ? { cookie } : {})
+    },
+    body: JSON.stringify({ username, password })
+  });
+  return { response, body: await response.json(), cookie: cookieFrom(response) };
+}
+
+async function api(base, route, { method = "GET", cookie = "", csrf = "", body } = {}) {
+  const response = await fetch(`${base}${route}`, {
+    method,
+    headers: {
+      accept: "application/json",
+      ...(cookie ? { cookie } : {}),
+      ...(csrf ? { "x-csrf-token": csrf } : {}),
+      ...(body === undefined ? {} : { "content-type": "application/json" })
+    },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const text = await response.text();
+  return { response, text, body: text ? JSON.parse(text) : null };
+}
+
+test("unsafe session secrets are rejected", () => {
+  for (const value of ["", "short", "change-me-to-a-long-random-string", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) {
+    assert.throws(() => requireSessionSecret(value), /SESSION_SECRET/);
+  }
+  assert.equal(requireSessionSecret(STRONG_SECRET), STRONG_SECRET);
+});
+
+test("server startup fails when the session secret is empty", async () => {
+  const child = spawn(process.execPath, ["server.js"], {
+    cwd: path.join(__dirname, ".."),
+    env: { ...process.env, SESSION_SECRET: "" },
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve) => child.once("exit", resolve));
+  assert.notEqual(code, 0);
+  assert.match(stderr, /SESSION_SECRET/);
+});
+
+test("HTTP access control, session lifecycle, ownership, and audit enforcement", async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "mafusheets-access-"));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const databasePath = path.join(directory, "app.sqlite");
+  const catalogPath = path.join(directory, "resources.json");
+  await fsp.writeFile(catalogPath, "[]\n");
+
+  const db = openDatabase(databasePath);
+  await migrateLegacyCatalog(db, catalogPath);
+  const users = createUserStore(db);
+  const admin = await users.createUser({
+    loginIdentifier: "admin@example.test",
+    displayName: "Admin",
+    password: "AdminPassword2026",
+    role: "admin"
+  });
+  const member = await users.createUser({
+    loginIdentifier: "member@example.test",
+    displayName: "Member",
+    password: "MemberPassword2026",
+    role: "member"
+  });
+  const other = await users.createUser({
+    loginIdentifier: "other@example.test",
+    displayName: "Other",
+    password: "OtherPassword2026",
+    role: "member"
+  });
+  assert.throws(() => users.setEnabled(admin.id, false), /last enabled administrator/);
+  assert.throws(() => users.setRole(admin.id, "member"), /last enabled administrator/);
+  createCatalogStore(db).replaceResources([
+    {
+      id: "member-resource",
+      title: "Member sheet",
+      category: "documents",
+      sheetKind: "pdf",
+      originalName: "member.pdf",
+      storedName: "member.pdf",
+      extension: ".pdf",
+      size: 10,
+      uploadedAt: new Date().toISOString(),
+      uploadedBy: member.id,
+      updatedBy: member.id,
+      annotations: []
+    },
+    {
+      id: "other-resource",
+      title: "Other sheet",
+      category: "documents",
+      sheetKind: "pdf",
+      originalName: "other.pdf",
+      storedName: "other.pdf",
+      extension: ".pdf",
+      size: 10,
+      uploadedAt: new Date().toISOString(),
+      uploadedBy: other.id,
+      updatedBy: other.id,
+      annotations: []
+    }
+  ], admin.id);
+  db.close();
+
+  const port = await unusedPort();
+  const base = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, ["server.js"], {
+    cwd: path.join(__dirname, ".."),
+    env: {
+      ...process.env,
+      HOST: "127.0.0.1",
+      PORT: String(port),
+      DATABASE_PATH: databasePath,
+      LEGACY_CATALOG_PATH: catalogPath,
+      SESSION_SECRET: STRONG_SECRET
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let childOutput = "";
+  child.stdout.on("data", (chunk) => { childOutput += chunk; });
+  child.stderr.on("data", (chunk) => { childOutput += chunk; });
+  t.after(() => child.kill("SIGTERM"));
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      if ((await fetch(`${base}/health`)).ok) break;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(child.exitCode, null, childOutput);
+
+  assert.equal((await api(base, "/api/resources")).response.status, 401);
+  assert.equal((await login(base, "member@example.test", "WrongPassword2026")).response.status, 401);
+
+  const firstMemberLogin = await login(base, "member@example.test", "MemberPassword2026", "mafusheets_admin=fixed");
+  assert.equal(firstMemberLogin.response.status, 200);
+  assert.notEqual(firstMemberLogin.cookie, "mafusheets_admin=fixed");
+  const secondMemberLogin = await login(base, "member@example.test", "MemberPassword2026", firstMemberLogin.cookie);
+  assert.notEqual(secondMemberLogin.cookie, firstMemberLogin.cookie);
+
+  const memberAuth = {
+    cookie: secondMemberLogin.cookie,
+    csrf: secondMemberLogin.body.csrfToken
+  };
+  assert.equal((await api(base, "/api/admin/thumbnails/refresh", {
+    method: "POST", ...memberAuth
+  })).response.status, 403);
+  assert.equal((await api(base, "/api/resources/other-resource", {
+    method: "PATCH", ...memberAuth, body: { title: "Stolen edit" }
+  })).response.status, 403);
+  assert.equal((await api(base, "/api/resources/member-resource", {
+    method: "PATCH", ...memberAuth, body: { title: "Owned edit" }
+  })).response.status, 200);
+  assert.equal((await api(base, "/api/resources/member-resource", {
+    method: "DELETE", ...memberAuth
+  })).response.status, 403);
+
+  const annotation = await api(base, "/api/resources/member-resource/annotations", {
+    method: "POST", ...memberAuth, body: { page: 1, text: "Mine" }
+  });
+  assert.equal(annotation.response.status, 201);
+
+  const otherLogin = await login(base, "other@example.test", "OtherPassword2026");
+  assert.equal((await api(
+    base,
+    `/api/resources/member-resource/annotations/${annotation.body.annotation.id}`,
+    { method: "DELETE", cookie: otherLogin.cookie, csrf: otherLogin.body.csrfToken }
+  )).response.status, 403);
+
+  const adminLogin = await login(base, "admin@example.test", "AdminPassword2026");
+  assert.equal((await api(base, "/api/resources/other-resource", {
+    method: "PATCH",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: { title: "Admin edit" }
+  })).response.status, 200);
+  assert.equal((await api(base, "/api/resources/other-resource", {
+    method: "DELETE",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken
+  })).response.status, 200);
+
+  const loginPage = await (await fetch(`${base}/login`)).text();
+  const mainPage = await (await fetch(`${base}/`, {
+    headers: { cookie: adminLogin.cookie }
+  })).text();
+  for (const forbidden of [STRONG_SECRET, "SESSION_SECRET", "DELETE_CODE", "deleteCode"]) {
+    assert.equal(loginPage.includes(forbidden), false);
+    assert.equal(mainPage.includes(forbidden), false);
+  }
+
+  const liveDb = openDatabase(databasePath);
+  createUserStore(liveDb).setEnabled(member.id, false);
+  assert.equal((await api(base, "/api/resources", memberAuth)).response.status, 401);
+  liveDb.close();
+
+  const logout = await api(base, "/api/auth/logout", {
+    method: "POST",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken
+  });
+  assert.equal(logout.response.status, 200);
+  assert.equal((await api(base, "/api/resources", { cookie: adminLogin.cookie })).response.status, 401);
+
+  const auditDb = openDatabase(databasePath);
+  const eventTypes = new Set(
+    auditDb.prepare("SELECT event_type FROM audit_events").all().map((row) => row.event_type)
+  );
+  for (const expected of [
+    "login_succeeded",
+    "login_rejected",
+    "logout",
+    "authorization_rejected",
+    "resource_modification_requested"
+  ]) {
+    assert.equal(eventTypes.has(expected), true, `missing ${expected}`);
+  }
+  auditDb.close();
+});

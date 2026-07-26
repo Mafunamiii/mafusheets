@@ -23,6 +23,9 @@ npm start
 Open `http://localhost:3000`.
 
 The server loads `.env` automatically if it exists. Use `.env.example` as the template for local runs and deployments.
+`SESSION_SECRET` is required and must be a persistent, non-placeholder value of at least 32
+characters. Generate one with `openssl rand -base64 48`. Startup fails closed when it is missing
+or weak; changing it invalidates all session cookies.
 Supply the initial account password only for the account command:
 
 ```bash
@@ -31,7 +34,11 @@ MAFUSHEETS_NEW_PASSWORD='choose-a-strong-unique-password' \
 ```
 
 There is no default account or password and no public registration route. Account commands also support
-`list-users`, `disable-user --id ID`, and `enable-user --id ID`.
+`list-users`, `disable-user --id ID`, `enable-user --id ID`,
+`reset-password --id ID`, and `change-role --id ID --role admin|member`. Supply replacement
+passwords through `MAFUSHEETS_NEW_PASSWORD`. Password resets revoke active sessions and require
+the user to change the temporary password unless `--no-required-change` is explicitly supplied.
+The final enabled administrator cannot be disabled or demoted.
 
 ## Run with Docker Compose
 
@@ -86,5 +93,7 @@ stop startup without creating an empty successful library.
 - Annotations are page-based, not coordinate-based.
 - The metronome is visual only, so it works in quiet settings.
 - The whole app is behind login now; unauthenticated visitors only see the login screen.
+- Session identifiers are stored only as keyed hashes. Audit records use a short keyed client
+  fingerprint for abuse investigation rather than retaining raw IP addresses.
 - Chord-providing website content is best saved as text, PDF, or a user-managed export that you upload here.
 - On tablets and smaller screens, use the separate Add sheet tab instead of keeping the upload form visible beside the library.
