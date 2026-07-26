@@ -1,0 +1,22 @@
+{
+  "name": "mafusheets",
+  "version": "1.0.0",
+  "description": "A personal music sheet library and viewer for PDFs, images, and chord charts.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "reindex": "node reindex.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "xlsx": "^0.18.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
