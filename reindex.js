@@ -1,26 +1,23 @@
-const fsp = require("fs/promises");
 const path = require("path");
 const { extractSearchText } = require("./search-indexer");
+const {
+  MIGRATION_ACTOR_ID,
+  createCatalogStore,
+  migrateLegacyCatalog,
+  openDatabase
+} = require("./lib/database");
 
 const ROOT = __dirname;
 const INDEX_FILE = path.join(ROOT, "data", "resources.json");
+const DATABASE_FILE = process.env.DATABASE_PATH || path.join(ROOT, "data", "mafusheets.sqlite");
 const UPLOADS_DIR = path.join(ROOT, "uploads");
 const FORCE_ALL = process.argv.includes("--all");
 
-async function readIndex() {
-  const raw = await fsp.readFile(INDEX_FILE, "utf8");
-  const resources = JSON.parse(raw || "[]");
-  return Array.isArray(resources) ? resources : [];
-}
-
-async function writeIndex(resources) {
-  const tmpFile = `${INDEX_FILE}.tmp`;
-  await fsp.writeFile(tmpFile, `${JSON.stringify(resources, null, 2)}\n`, "utf8");
-  await fsp.rename(tmpFile, INDEX_FILE);
-}
-
 async function main() {
-  const resources = await readIndex();
+  const db = openDatabase(DATABASE_FILE);
+  await migrateLegacyCatalog(db, INDEX_FILE);
+  const catalog = createCatalogStore(db);
+  const resources = catalog.listResources();
   let indexed = 0;
   let skipped = 0;
 
@@ -46,8 +43,9 @@ async function main() {
     console.log(`${resource.searchStatus}: ${resource.originalName}`);
   }
 
-  await writeIndex(resources);
+  catalog.replaceResources(resources, MIGRATION_ACTOR_ID);
   console.log(`Done. Indexed ${indexed}, skipped ${skipped}.`);
+  db.close();
 }
 
 main().catch((error) => {

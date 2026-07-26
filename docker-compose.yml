@@ -8,13 +8,10 @@ services:
       HOST: ${HOST:-0.0.0.0}
       PORT: ${PORT:-3000}
       PDFTOPPM_BIN: ${PDFTOPPM_BIN:-pdftoppm}
-      ADMIN_USER: ${ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
-      DELETE_CODE: ${DELETE_CODE:-DELETECODE}
+      DATABASE_PATH: ${DATABASE_PATH:-/app/data/mafusheets.sqlite}
+      DELETE_CODE: ${DELETE_CODE:-}
       SESSION_SECRET: ${SESSION_SECRET:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
-      UPLOAD_CODE: ${UPLOAD_CODE:-}
     volumes:
       - ./data:/app/data
       - ./uploads:/app/uploads

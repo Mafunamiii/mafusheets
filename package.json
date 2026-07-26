@@ -5,9 +5,13 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "reindex": "node reindex.js"
+    "reindex": "node reindex.js",
+    "account": "node lib/bootstrap.js",
+    "test": "node --test"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^11.10.0",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "jszip": "^3.10.1",

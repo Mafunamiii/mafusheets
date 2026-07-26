@@ -8,6 +8,8 @@ const crypto = require("crypto");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { extractSearchText, normalizeSearchText } = require("./search-indexer");
+const { createCatalogStore, migrateLegacyCatalog, openDatabase } = require("./lib/database");
+const { createUserStore } = require("./lib/users");
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -54,17 +56,18 @@ const UPLOADS_DIR = path.join(ROOT, "uploads");
 const TMP_DIR = path.join(ROOT, ".tmp");
 const THUMB_DIR = path.join(DATA_DIR, "thumbnails");
 const INDEX_FILE = path.join(DATA_DIR, "resources.json");
+const DATABASE_FILE = process.env.DATABASE_PATH || path.join(DATA_DIR, "mafusheets.sqlite");
 const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || (process.platform === "win32" ? "pdftoppm.cmd" : "pdftoppm");
 const MAX_FILE_SIZE = 250 * 1024 * 1024;
 const MAX_FILES_PER_UPLOAD = 10;
-const DELETE_CODE = process.env.DELETE_CODE || "DELETECODE";
-const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.UPLOAD_CODE || "MAFUJAHN";
-const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || "";
+const DELETE_CODE = process.env.DELETE_CODE || "";
 const SESSION_COOKIE = "mafusheets_admin";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 let indexQueue = Promise.resolve();
+let database;
+let catalogStore;
+let userStore;
 const sessions = new Map();
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -168,11 +171,10 @@ async function ensureStorage() {
     )
   );
 
-  try {
-    await fsp.access(INDEX_FILE);
-  } catch {
-    await fsp.writeFile(INDEX_FILE, "[]\n", "utf8");
-  }
+  database = openDatabase(DATABASE_FILE);
+  await migrateLegacyCatalog(database, INDEX_FILE);
+  catalogStore = createCatalogStore(database);
+  userStore = createUserStore(database);
 }
 
 function parseCookies(req) {
@@ -247,7 +249,19 @@ function getSession(req) {
     return null;
   }
 
-  return { token, ...session };
+  const currentUser = userStore && session.userId ? userStore.getUserById(session.userId) : null;
+  if (!currentUser || !currentUser.enabled) {
+    sessions.delete(token);
+    return null;
+  }
+
+  return {
+    token,
+    ...session,
+    user: currentUser.loginIdentifier,
+    role: currentUser.role,
+    displayName: currentUser.displayName
+  };
 }
 
 function setSessionCookie(res, token) {
@@ -299,18 +313,27 @@ function isSameOrigin(req) {
   }
 }
 
-function requireAdmin(req, res, next) {
+function requireAuthenticated(req, res, next) {
   const session = getSession(req);
   if (!session) {
     if (req.accepts("html")) {
       return res.status(401).type("html").send(renderLoginHtml());
     }
 
-    return res.status(401).json({ error: "Admin login required." });
+    return res.status(401).json({ error: "Login required." });
   }
 
   req.adminSession = session;
   return next();
+}
+
+function requireAdmin(req, res, next) {
+  return requireAuthenticated(req, res, () => {
+    if (req.adminSession.role !== "admin") {
+      return res.status(403).json({ error: "Administrator access required." });
+    }
+    return next();
+  });
 }
 
 function requireSameOrigin(req, res, next) {
@@ -333,39 +356,23 @@ function requireCsrf(req, res, next) {
   return next();
 }
 
-function issueSession(username) {
+function issueSession(user) {
   const token = crypto.randomBytes(32).toString("hex");
   const csrfToken = crypto.randomBytes(32).toString("hex");
   const expiresAt = Date.now() + SESSION_TTL_MS;
-  sessions.set(token, { user: username, csrfToken, expiresAt });
-  return { token, csrfToken, expiresAt, user: username };
+  sessions.set(token, {
+    user: user.loginIdentifier,
+    userId: user.id,
+    role: user.role,
+    displayName: user.displayName,
+    csrfToken,
+    expiresAt
+  });
+  return { token, csrfToken, expiresAt, ...sessions.get(token) };
 }
 
 function revokeSession(token) {
   sessions.delete(token);
-}
-
-function hashPassword(password) {
-  return crypto.createHash("sha256").update(String(password)).digest("hex");
-}
-
-function verifyAdminPassword(password) {
-  const candidate = hashPassword(password);
-  const configuredHash = ADMIN_PASSWORD_HASH ? ADMIN_PASSWORD_HASH.trim().toLowerCase() : "";
-
-  if (configuredHash) {
-    if (candidate.length !== configuredHash.length) {
-      return false;
-    }
-
-    return crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(configuredHash));
-  }
-
-  if (!ADMIN_PASSWORD) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(hashPassword(ADMIN_PASSWORD)));
 }
 
 function isAuthenticated(req) {
@@ -373,26 +380,20 @@ function isAuthenticated(req) {
 }
 
 async function readIndex() {
-  try {
-    const raw = await fsp.readFile(INDEX_FILE, "utf8");
-    const parsed = JSON.parse(raw || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+  if (!catalogStore) throw new Error("Catalog database is not initialized.");
+  return catalogStore.listResources();
 }
 
-async function writeIndex(resources) {
-  const tmpFile = `${INDEX_FILE}.tmp`;
-  await fsp.writeFile(tmpFile, `${JSON.stringify(resources, null, 2)}\n`, "utf8");
-  await fsp.rename(tmpFile, INDEX_FILE);
+async function writeIndex(resources, actorId) {
+  if (!catalogStore) throw new Error("Catalog database is not initialized.");
+  catalogStore.replaceResources(resources, actorId);
 }
 
-async function updateIndex(mutator) {
+async function updateIndex(mutator, actorId) {
   const task = indexQueue.then(async () => {
     const resources = await readIndex();
     const result = await mutator(resources);
-    await writeIndex(resources);
+    await writeIndex(resources, actorId);
     return result;
   });
 
@@ -691,6 +692,7 @@ app.get("/api/auth/me", (req, res) => {
   res.json({
     authenticated: Boolean(session),
     user: session ? session.user : null,
+    role: session ? session.role : null,
     csrfToken: session ? session.csrfToken : ""
   });
 });
@@ -698,23 +700,23 @@ app.get("/api/auth/me", (req, res) => {
 app.post("/api/auth/login", authLimiter, requireSameOrigin, async (req, res) => {
   const username = cleanText(req.body.username, 64);
   const password = String(req.body.password || "");
-
-  if (username !== ADMIN_USER || !verifyAdminPassword(password)) {
-    return res.status(403).json({ error: "Invalid admin credentials." });
+  const user = await userStore.authenticate(username, password);
+  if (!user) {
+    return res.status(403).json({ error: "Invalid credentials or disabled account." });
   }
 
-  const session = issueSession(username);
+  const session = issueSession(user);
   setSessionCookie(res, session.token);
-  res.json({ ok: true, user: session.user, csrfToken: session.csrfToken });
+  res.json({ ok: true, user: session.user, role: session.role, csrfToken: session.csrfToken });
 });
 
-app.post("/api/auth/logout", requireAdmin, requireSameOrigin, requireCsrf, (req, res) => {
+app.post("/api/auth/logout", requireAuthenticated, requireSameOrigin, requireCsrf, (req, res) => {
   revokeSession(req.adminSession.token);
   clearSessionCookie(res);
   res.json({ ok: true });
 });
 
-app.get("/api/resources", requireAdmin, async (req, res) => {
+app.get("/api/resources", requireAuthenticated, async (req, res) => {
   const activeKind = String(req.query.kind || "all").trim().toLowerCase();
   const query = String(req.query.q || "");
   const resources = await readIndex();
@@ -733,7 +735,7 @@ app.get("/api/resources", requireAdmin, async (req, res) => {
   });
 });
 
-app.get("/api/resources/:id", requireAdmin, async (req, res) => {
+app.get("/api/resources/:id", requireAuthenticated, async (req, res) => {
   const resources = await readIndex();
   const resource = getResourceById(resources, req.params.id);
 
@@ -775,7 +777,7 @@ app.patch("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, as
     resource.bpm = bpm;
     resource.updatedAt = new Date().toISOString();
     return fullResource(resource);
-  })
+  }, req.adminSession.userId)
     .then((result) => {
       if (!result) {
         return res.status(404).json({ error: "Sheet not found." });
@@ -795,6 +797,10 @@ app.patch("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, as
 app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
   const deleteCode = String(req.body.deleteCode || "").trim();
 
+  if (!DELETE_CODE) {
+    return res.status(503).json({ error: "Resource deletion is not configured." });
+  }
+
   if (deleteCode !== DELETE_CODE) {
     return res.status(403).json({ error: "Invalid delete confirmation code." });
   }
@@ -810,7 +816,7 @@ app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, a
     deletedResource = resources[index];
     resources.splice(index, 1);
     return true;
-  })
+  }, req.adminSession.userId)
     .then(async (result) => {
       if (result === null) {
         return res.status(404).json({ error: "Sheet not found." });
@@ -855,7 +861,7 @@ app.post("/api/resources/:id/annotations", requireAdmin, requireSameOrigin, requ
     resource.annotations.push(annotation);
     resource.updatedAt = new Date().toISOString();
     return annotation;
-  })
+  }, req.adminSession.userId)
     .then((annotation) => {
       if (!annotation) {
         return res.status(404).json({ error: "Sheet not found." });
@@ -885,7 +891,7 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAdmin, require
     resource.annotations = nextAnnotations;
     resource.updatedAt = new Date().toISOString();
     return true;
-  })
+  }, req.adminSession.userId)
     .then((result) => {
       if (result === null) {
         return res.status(404).json({ error: "Sheet not found." });
@@ -903,7 +909,7 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAdmin, require
     });
 });
 
-app.post("/api/upload", uploadLimiter, requireAdmin, requireSameOrigin, requireCsrf, upload.array("files", MAX_FILES_PER_UPLOAD), async (req, res) => {
+app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, requireCsrf, upload.array("files", MAX_FILES_PER_UPLOAD), async (req, res) => {
   const kind = normalizeKind(req.body.kind);
   const title = cleanText(req.body.title);
   const artist = cleanText(req.body.artist, 120);
@@ -969,6 +975,8 @@ app.post("/api/upload", uploadLimiter, requireAdmin, requireSameOrigin, requireC
         extension,
         size: file.size,
         uploadedAt,
+        uploadedBy: req.adminSession.userId,
+        updatedBy: req.adminSession.userId,
         searchText: searchIndex.searchText,
         searchStatus: searchIndex.searchStatus,
         indexedAt: new Date().toISOString(),
@@ -983,7 +991,7 @@ app.post("/api/upload", uploadLimiter, requireAdmin, requireSameOrigin, requireC
 
     await updateIndex((resources) => {
       resources.push(...created);
-    });
+    }, req.adminSession.userId);
 
     res.status(201).json({ resources: created.map(publicResource) });
   } catch (error) {
@@ -1016,7 +1024,7 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
   }
 });
 
-app.get("/sheets/:id", requireAdmin, async (req, res) => {
+app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
   const resources = await readIndex();
   const resource = getResourceById(resources, req.params.id);
   const session = getSession(req);
@@ -1040,7 +1048,7 @@ app.get("/sheets/:id", requireAdmin, async (req, res) => {
   }));
 });
 
-app.get("/thumbnails/:id.png", requireAdmin, async (req, res) => {
+app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
   const resources = await readIndex();
   const resource = getResourceById(resources, req.params.id);
 
@@ -1076,7 +1084,7 @@ app.get("/thumbnails/:id.png", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/files/:id", requireAdmin, async (req, res) => {
+app.get("/files/:id", requireAuthenticated, async (req, res) => {
   const resources = await readIndex();
   const resource = resources.find((item) => item.id === req.params.id);
 
@@ -2843,7 +2851,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
             <h2>Library actions</h2>
             <p class="panel-subtitle">Upload, login, and thumbnail maintenance live here.</p>
           </div>
-          <span class="pill" id="authBadge">${authenticated ? `Signed in as ${escapeHtmlText(username || ADMIN_USER)}` : "Signed out"}</span>
+          <span class="pill" id="authBadge">${authenticated ? `Signed in as ${escapeHtmlText(username || "account")}` : "Signed out"}</span>
         </div>
 
         <div class="tabs" id="sideTabs">

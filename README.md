@@ -23,6 +23,15 @@ npm start
 Open `http://localhost:3000`.
 
 The server loads `.env` automatically if it exists. Use `.env.example` as the template for local runs and deployments.
+Supply the initial account password only for the account command:
+
+```bash
+MAFUSHEETS_NEW_PASSWORD='choose-a-strong-unique-password' \
+  npm run account -- create-user --login director --display-name "Choir Director" --role admin
+```
+
+There is no default account or password and no public registration route. Account commands also support
+`list-users`, `disable-user --id ID`, and `enable-user --id ID`.
 
 ## Run with Docker Compose
 
@@ -63,9 +72,14 @@ The app stores files in:
 - `uploads/documents`
 - `uploads/photos`
 - `uploads/slides`
-- `data/resources.json`
+- `data/mafusheets.sqlite`
 
-Back up `uploads/` and `data/resources.json` together.
+Back up `uploads/` and the SQLite database together.
+
+On first startup, an existing `data/resources.json` is validated and imported transactionally. The
+original bytes are retained in a read-only `data/resources.json.migration-backup-*.json` file, and
+the JSON catalog is never written again. Invalid JSON, duplicate IDs, or conflicting stored paths
+stop startup without creating an empty successful library.
 
 ## Notes
 
