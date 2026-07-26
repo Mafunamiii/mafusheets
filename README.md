@@ -10,7 +10,7 @@ MafuSheets is a personal music sheet library and viewer for PDFs, images, and ch
 - Search by title, artist, tags, notes, filename, and extracted text
 - Preview PDFs, images, and text-based chord charts in the browser
 - Use a built-in visual metronome for rehearsal or mass
-- Sign in as an admin to upload, edit, delete, and refresh thumbnails
+- Sign in as an admin to access the entire library, reader, uploads, downloads, and maintenance tools
 
 ## Run locally
 
@@ -71,5 +71,6 @@ Back up `uploads/` and `data/resources.json` together.
 
 - Annotations are page-based, not coordinate-based.
 - The metronome is visual only, so it works in quiet settings.
+- The whole app is behind login now; unauthenticated visitors only see the login screen.
 - Chord-providing website content is best saved as text, PDF, or a user-managed export that you upload here.
 - On tablets and smaller screens, use the separate Add sheet tab instead of keeping the upload form visible beside the library.

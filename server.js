@@ -303,7 +303,7 @@ function requireAdmin(req, res, next) {
   const session = getSession(req);
   if (!session) {
     if (req.accepts("html")) {
-      return res.status(401).type("html").send(renderMainHtml({ authenticated: false, csrfToken: "" }));
+      return res.status(401).type("html").send(renderLoginHtml());
     }
 
     return res.status(401).json({ error: "Admin login required." });
@@ -666,11 +666,24 @@ async function removeTempFiles(files) {
 
 app.get("/", (req, res) => {
   const session = getSession(req);
+  if (!session) {
+    return res.type("html").send(renderLoginHtml());
+  }
+
   res.type("html").send(renderMainHtml({
-    authenticated: Boolean(session),
-    csrfToken: session ? session.csrfToken : "",
-    username: session ? session.user : ""
+    authenticated: true,
+    csrfToken: session.csrfToken,
+    username: session.user
   }));
+});
+
+app.get("/login", (req, res) => {
+  const session = getSession(req);
+  if (session) {
+    return res.redirect("/");
+  }
+
+  return res.type("html").send(renderLoginHtml());
 });
 
 app.get("/api/auth/me", (req, res) => {
@@ -701,7 +714,7 @@ app.post("/api/auth/logout", requireAdmin, requireSameOrigin, requireCsrf, (req,
   res.json({ ok: true });
 });
 
-app.get("/api/resources", async (req, res) => {
+app.get("/api/resources", requireAdmin, async (req, res) => {
   const activeKind = String(req.query.kind || "all").trim().toLowerCase();
   const query = String(req.query.q || "");
   const resources = await readIndex();
@@ -720,7 +733,7 @@ app.get("/api/resources", async (req, res) => {
   });
 });
 
-app.get("/api/resources/:id", async (req, res) => {
+app.get("/api/resources/:id", requireAdmin, async (req, res) => {
   const resources = await readIndex();
   const resource = getResourceById(resources, req.params.id);
 
@@ -1003,7 +1016,7 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
   }
 });
 
-app.get("/sheets/:id", async (req, res) => {
+app.get("/sheets/:id", requireAdmin, async (req, res) => {
   const resources = await readIndex();
   const resource = getResourceById(resources, req.params.id);
   const session = getSession(req);
@@ -1027,7 +1040,7 @@ app.get("/sheets/:id", async (req, res) => {
   }));
 });
 
-app.get("/thumbnails/:id.png", async (req, res) => {
+app.get("/thumbnails/:id.png", requireAdmin, async (req, res) => {
   const resources = await readIndex();
   const resource = getResourceById(resources, req.params.id);
 
@@ -1063,7 +1076,7 @@ app.get("/thumbnails/:id.png", async (req, res) => {
   }
 });
 
-app.get("/files/:id", async (req, res) => {
+app.get("/files/:id", requireAdmin, async (req, res) => {
   const resources = await readIndex();
   const resource = resources.find((item) => item.id === req.params.id);
 
@@ -1108,10 +1121,14 @@ app.use((error, _req, res, next) => {
 
 app.use((req, res) => {
   const session = getSession(req);
-  res.status(404).type("html").send(renderMainHtml({
-    authenticated: Boolean(session),
-    csrfToken: session ? session.csrfToken : "",
-    username: session ? session.user : ""
+  if (!session) {
+    return res.type("html").send(renderLoginHtml());
+  }
+
+  return res.status(404).type("html").send(renderMainHtml({
+    authenticated: true,
+    csrfToken: session.csrfToken,
+    username: session.user
   }));
 });
 
@@ -1822,6 +1839,197 @@ function renderReaderHtml(resourceId, { authenticated = false, csrfToken = "", u
     loadResource().catch(function(error) {
       readerTitle.textContent = "Could not load sheet";
       readerMeta.textContent = error.message;
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderLoginHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MafuSheets Login</title>
+  <link rel="icon" type="image/png" href="/assets/logo.png">
+  <style>
+    :root {
+      color-scheme: dark;
+      --accent: #2b0476;
+      --accent-light: #7c4dff;
+      --bg: #111216;
+      --panel: #191b21;
+      --line: #30333d;
+      --text: #f2f4f8;
+      --muted: #aeb4c1;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top left, rgba(43, 4, 118, .38), transparent 34rem),
+        linear-gradient(145deg, #101116 0%, #17191f 52%, #101116 100%);
+      color: var(--text);
+      padding: 20px;
+    }
+
+    .login {
+      width: min(440px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(25, 27, 33, .94);
+      box-shadow: var(--shadow);
+      padding: 22px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .login-head {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .login-head img {
+      width: 58px;
+      height: 58px;
+      border-radius: 10px;
+      object-fit: cover;
+      border: 1px solid rgba(124, 77, 255, .26);
+      background: #120d23;
+    }
+
+    .login-head h1 {
+      margin: 0 0 4px;
+      font-size: 1.15rem;
+    }
+
+    .login-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: .92rem;
+      line-height: 1.5;
+    }
+
+    form {
+      display: grid;
+      gap: 12px;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: .88rem;
+    }
+
+    input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111318;
+      color: var(--text);
+      padding: 10px 12px;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: var(--accent-light);
+      box-shadow: 0 0 0 3px rgba(124, 77, 255, .18);
+    }
+
+    button {
+      min-height: 46px;
+      border: 0;
+      border-radius: 8px;
+      font-weight: 750;
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--accent), #4a16b6);
+      color: white;
+    }
+
+    .message {
+      min-height: 22px;
+      color: var(--muted);
+      font-size: .9rem;
+      line-height: 1.45;
+    }
+
+    .message.error { color: #ff6b6b; }
+    .message.ok { color: #79d99b; }
+  </style>
+</head>
+<body>
+  <main class="login">
+    <div class="login-head">
+      <img src="/assets/logo.png" alt="">
+      <div>
+        <h1>MafuSheets</h1>
+        <p>Sign in to access the sheet library, reader, and downloads.</p>
+      </div>
+    </div>
+
+    <form id="loginForm">
+      <label>
+        Username
+        <input id="loginUserInput" name="username" autocomplete="username" required>
+      </label>
+      <label>
+        Password
+        <input id="loginPasswordInput" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button id="loginButton" type="submit">Sign in</button>
+      <div class="message" id="loginMessage"></div>
+    </form>
+  </main>
+
+  <script>
+    const loginForm = document.querySelector("#loginForm");
+    const loginUserInput = document.querySelector("#loginUserInput");
+    const loginPasswordInput = document.querySelector("#loginPasswordInput");
+    const loginButton = document.querySelector("#loginButton");
+    const loginMessage = document.querySelector("#loginMessage");
+
+    loginForm.addEventListener("submit", async function(event) {
+      event.preventDefault();
+      loginButton.disabled = true;
+      loginMessage.textContent = "Signing in...";
+      loginMessage.className = "message";
+
+      try {
+        const response = await fetch("/api/auth/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: loginUserInput.value,
+            password: loginPasswordInput.value
+          })
+        });
+        const result = await response.json();
+
+        if (!response.ok) {
+          throw new Error(result.error || "Could not sign in.");
+        }
+
+        loginMessage.textContent = "Signed in.";
+        loginMessage.className = "message ok";
+        window.location.href = "/";
+      } catch (error) {
+        loginMessage.textContent = error.message;
+        loginMessage.className = "message error";
+      } finally {
+        loginButton.disabled = false;
+      }
     });
   </script>
 </body>
