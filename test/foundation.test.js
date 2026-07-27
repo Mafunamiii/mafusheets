@@ -50,7 +50,7 @@ test("clean database initialization enables schema and foreign keys", async (t) 
   const result = await migrateLegacyCatalog(db, catalogPath);
   assert.equal(result.status, "initialized-empty");
   assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 2);
+  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 3);
   assert.equal(createCatalogStore(db).listResources().length, 0);
 });
 

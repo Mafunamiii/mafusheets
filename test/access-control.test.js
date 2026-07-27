@@ -84,6 +84,12 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
   t.after(() => fsp.rm(directory, { recursive: true, force: true }));
   const databasePath = path.join(directory, "app.sqlite");
   const catalogPath = path.join(directory, "resources.json");
+  const uploadsPath = path.join(directory, "uploads");
+  const thumbnailsPath = path.join(directory, "thumbnails");
+  const temporaryPath = path.join(directory, "tmp");
+  await fsp.mkdir(path.join(uploadsPath, "documents"), { recursive: true });
+  await fsp.writeFile(path.join(uploadsPath, "documents", "member.pdf"), "member");
+  await fsp.writeFile(path.join(uploadsPath, "documents", "other.pdf"), "other");
   await fsp.writeFile(catalogPath, "[]\n");
 
   const db = openDatabase(databasePath);
@@ -151,6 +157,10 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
       PORT: String(port),
       DATABASE_PATH: databasePath,
       LEGACY_CATALOG_PATH: catalogPath,
+      UPLOADS_DIR: uploadsPath,
+      THUMB_DIR: thumbnailsPath,
+      TMP_DIR: temporaryPath,
+      QUARANTINE_DIR: path.join(directory, "quarantine"),
       SESSION_SECRET: STRONG_SECRET
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -213,11 +223,12 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
     csrf: adminLogin.body.csrfToken,
     body: { title: "Admin edit" }
   })).response.status, 200);
-  assert.equal((await api(base, "/api/resources/other-resource", {
+  const adminDelete = await api(base, "/api/resources/other-resource", {
     method: "DELETE",
     cookie: adminLogin.cookie,
     csrf: adminLogin.body.csrfToken
-  })).response.status, 200);
+  });
+  assert.equal(adminDelete.response.status, 200, `${adminDelete.text}\n${childOutput}`);
 
   const loginPage = await (await fetch(`${base}/login`)).text();
   const mainPage = await (await fetch(`${base}/`, {

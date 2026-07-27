@@ -10,6 +10,7 @@ const { promisify } = require("util");
 const { extractSearchText, normalizeSearchText } = require("./search-indexer");
 const { createCatalogStore, migrateLegacyCatalog, openDatabase } = require("./lib/database");
 const { createUserStore } = require("./lib/users");
+const { createResourceStore } = require("./lib/resources");
 const {
   SESSION_TTL_MS,
   auditEvent,
@@ -59,9 +60,11 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
-const UPLOADS_DIR = path.join(ROOT, "uploads");
-const TMP_DIR = path.join(ROOT, ".tmp");
-const THUMB_DIR = path.join(DATA_DIR, "thumbnails");
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(ROOT, "uploads");
+const TMP_DIR = process.env.TMP_DIR || path.join(ROOT, ".tmp");
+const STAGING_DIR = path.join(TMP_DIR, "staging");
+const TRASH_DIR = process.env.QUARANTINE_DIR || path.join(DATA_DIR, "quarantine");
+const THUMB_DIR = process.env.THUMB_DIR || path.join(DATA_DIR, "thumbnails");
 const INDEX_FILE = process.env.LEGACY_CATALOG_PATH || path.join(DATA_DIR, "resources.json");
 const DATABASE_FILE = process.env.DATABASE_PATH || path.join(DATA_DIR, "mafusheets.sqlite");
 const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || (process.platform === "win32" ? "pdftoppm.cmd" : "pdftoppm");
@@ -69,11 +72,12 @@ const MAX_FILE_SIZE = 250 * 1024 * 1024;
 const MAX_FILES_PER_UPLOAD = 10;
 const SESSION_COOKIE = "mafusheets_admin";
 const SESSION_SECRET = requireSessionSecret(process.env.SESSION_SECRET);
-let indexQueue = Promise.resolve();
 let database;
 let catalogStore;
 let userStore;
 let sessionStore;
+let resourceStore;
+let startupIntegrityReport = null;
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -137,7 +141,7 @@ const mimeTypes = {
 };
 
 const upload = multer({
-  dest: TMP_DIR,
+  dest: STAGING_DIR,
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: MAX_FILES_PER_UPLOAD
@@ -184,6 +188,8 @@ app.get("/assets/banner.png", allowPublic, (_req, res) => {
 async function ensureStorage() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
   await fsp.mkdir(TMP_DIR, { recursive: true });
+  await fsp.mkdir(STAGING_DIR, { recursive: true });
+  await fsp.mkdir(TRASH_DIR, { recursive: true });
   await fsp.mkdir(THUMB_DIR, { recursive: true });
   await Promise.all(
     ["documents", "photos", "slides"].map((category) =>
@@ -194,9 +200,18 @@ async function ensureStorage() {
   database = openDatabase(DATABASE_FILE);
   await migrateLegacyCatalog(database, INDEX_FILE);
   catalogStore = createCatalogStore(database);
+  resourceStore = createResourceStore(database);
   userStore = createUserStore(database);
   sessionStore = createSessionStore(database, SESSION_SECRET);
   sessionStore.purgeExpired();
+  startupIntegrityReport = await resourceStore.reportIntegrity({
+    uploadsDir: UPLOADS_DIR,
+    stagingDir: STAGING_DIR,
+    trashDir: TRASH_DIR
+  });
+  if (!startupIntegrityReport.ok) {
+    console.error(`Startup integrity check found ${startupIntegrityReport.issues.length} issue(s). Run "npm run integrity".`);
+  }
 }
 
 function parseCookies(req) {
@@ -428,23 +443,6 @@ async function readIndex() {
   return catalogStore.listResources();
 }
 
-async function writeIndex(resources, actorId) {
-  if (!catalogStore) throw new Error("Catalog database is not initialized.");
-  catalogStore.replaceResources(resources, actorId);
-}
-
-async function updateIndex(mutator, actorId) {
-  const task = indexQueue.then(async () => {
-    const resources = await readIndex();
-    const result = await mutator(resources);
-    await writeIndex(resources, actorId);
-    return result;
-  });
-
-  indexQueue = task.catch(() => undefined);
-  return task;
-}
-
 function cleanText(value, limit = 120) {
   return String(value || "")
     .replace(/\s+/g, " ")
@@ -642,7 +640,7 @@ async function ensurePdfThumbnail(resource, { force = false } = {}) {
     return null;
   }
 
-  const outputPrefix = path.join(THUMB_DIR, resource.id);
+  const temporaryPrefix = path.join(THUMB_DIR, `.${resource.id}-${crypto.randomUUID()}`);
   await execFileAsync(PDFTOPPM_BIN, [
     "-f", "1",
     "-l", "1",
@@ -651,9 +649,9 @@ async function ensurePdfThumbnail(resource, { force = false } = {}) {
     "-scale-to-x", "520",
     "-scale-to-y", "-1",
     sourcePath,
-    outputPrefix
+    temporaryPrefix
   ], { timeout: 30000, windowsHide: true, shell: process.platform === "win32" });
-
+  await fsp.rename(`${temporaryPrefix}.png`, thumbnailPath);
   return thumbnailPath;
 }
 
@@ -677,30 +675,31 @@ async function ensureImageThumbnail(resource, { force = false } = {}) {
     return null;
   }
 
-  await fsp.copyFile(sourcePath, thumbnailPath);
+  const temporaryPath = path.join(THUMB_DIR, `.${resource.id}-${crypto.randomUUID()}.tmp`);
+  await fsp.copyFile(sourcePath, temporaryPath);
+  try {
+    await fsp.rename(temporaryPath, thumbnailPath);
+  } catch (error) {
+    await fsp.unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
   return thumbnailPath;
 }
 
 async function ensureResourceThumbnail(resource, options = {}) {
-  if (resource.extension === ".pdf") {
-    return ensurePdfThumbnail(resource, options);
+  const owner = crypto.randomUUID();
+  const release = resourceStore
+    ? resourceStore.acquireLock(`resource:${resource.id}`, owner, 60000)
+    : () => {};
+  try {
+    if (resource.extension === ".pdf") return ensurePdfThumbnail(resource, options);
+    if ([".png", ".jpg", ".jpeg"].includes(resource.extension)) {
+      return ensureImageThumbnail(resource, options);
+    }
+    return null;
+  } finally {
+    release();
   }
-
-  if ([".png", ".jpg", ".jpeg"].includes(resource.extension)) {
-    return ensureImageThumbnail(resource, options);
-  }
-
-  return null;
-}
-
-async function removeResourceFiles(resource) {
-  const filePath = resolveResourceFile(resource);
-  const thumbnailPath = path.join(THUMB_DIR, `${resource.id}.png`);
-
-  await Promise.all([
-    filePath ? fsp.unlink(filePath).catch(() => undefined) : Promise.resolve(),
-    fsp.unlink(thumbnailPath).catch(() => undefined)
-  ]);
 }
 
 async function removeTempFiles(files) {
@@ -841,71 +840,110 @@ app.patch("/api/resources/:id", requireAuthenticated, requireSameOrigin, require
   const capo = cleanNumber(req.body.capo, { min: 0, max: 24 });
   const bpm = cleanNumber(req.body.bpm, { min: 20, max: 400 });
 
-  await updateIndex((resources) => {
-    const resource = getResourceById(resources, req.params.id);
+  if (!updates.title) return res.status(400).json({ error: "A title is required." });
+  try {
+    const result = resourceStore.updateMetadata(req.params.id, { ...updates, capo, bpm }, req.adminSession.userId);
+    if (!result) return res.status(404).json({ error: "Sheet not found." });
+    const resource = getResourceById(await readIndex(), req.params.id);
+    return res.json({ resource: fullResource(resource) });
+  } catch (error) {
+    resourceStore.recordFailure({
+      operationType: "cleanup", actorId: req.adminSession.userId,
+      resourceId: req.params.id, error, details: { operation: "metadata_update" }
+    });
+    console.error(error);
+    return res.status(500).json({ error: "Update failed." });
+  }
+});
 
-    if (!resource) {
-      return null;
+app.post(
+  "/api/resources/:id/file",
+  requireAuthenticated,
+  requireSameOrigin,
+  requireCsrf,
+  requireResourceEditor,
+  upload.single("file"),
+  async (req, res) => {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "Choose a replacement file." });
+    const current = req.authorizedResource;
+    const kind = normalizeKind(req.body.kind) || current.sheetKind;
+    const extension = path.extname(file.originalname || "").toLowerCase();
+    if (!isAllowedForKind(kind, extension)) {
+      await removeTempFiles([file]);
+      return res.status(400).json({ error: "The replacement file type is not allowed." });
     }
-
-    if (!updates.title) {
-      throw new Error("A title is required.");
-    }
-
-    resource.title = updates.title;
-    resource.artist = updates.artist;
-    resource.key = updates.key;
-    resource.notes = updates.notes;
-    resource.tags = updates.tags;
-    resource.capo = capo;
-    resource.bpm = bpm;
-    resource.updatedAt = new Date().toISOString();
-    resource.updatedBy = req.adminSession.userId;
-    return fullResource(resource);
-  }, req.adminSession.userId)
-    .then((result) => {
+    const id = crypto.randomUUID();
+    const category = getStorageCategory(kind, extension);
+    const storedName = `${Date.now()}-${id}${extension}`;
+    const finalPath = path.join(UPLOADS_DIR, category, storedName);
+    const originalPath = resolveResourceFile(current);
+    const backupPath = path.join(TRASH_DIR, `replacement-${id}-${current.storedName}`);
+    try {
+      const search = await extractSearchText(file.path, extension);
+      const result = resourceStore.replaceFile(req.params.id, {
+        stagedPath: file.path,
+        finalPath,
+        originalPath,
+        backupPath,
+        category,
+        originalName: file.originalname,
+        storedName,
+        extension,
+        size: file.size,
+        sheetKind: sheetKindForExtension(extension),
+        searchText: search.searchText,
+        searchStatus: search.searchStatus
+      }, req.adminSession.userId);
       if (!result) {
+        await removeTempFiles([file]);
         return res.status(404).json({ error: "Sheet not found." });
       }
-      return res.json({ resource: result });
-    })
-    .catch((error) => {
-      if (error.message === "A title is required.") {
-        return res.status(400).json({ error: error.message });
-      }
-
+      await fsp.unlink(path.join(THUMB_DIR, `${current.id}.png`)).catch(() => undefined);
+      const updated = getResourceById(await readIndex(), req.params.id);
+      await ensureResourceThumbnail(updated, { force: true }).catch((error) => {
+        resourceStore.finishOperation(result.thumbnailOperationId, error);
+      });
+      if (result.thumbnailOperationId) resourceStore.finishOperation(result.thumbnailOperationId);
+      return res.json({ resource: fullResource(updated) });
+    } catch (error) {
+      await removeTempFiles([file]);
       console.error(error);
-      return res.status(500).json({ error: "Update failed." });
-    });
-});
+      return res.status(500).json({ error: "Replacement failed; the original file was retained." });
+    }
+  }
+);
 
 app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
   recordAudit(req, "resource_modification_requested", "resource", req.params.id, { operation: "delete" });
 
-  let deletedResource = null;
-
-  await updateIndex((resources) => {
-    const index = resources.findIndex((item) => item.id === req.params.id);
-    if (index === -1) {
-      return null;
+  const resource = getResourceById(await readIndex(), req.params.id);
+  if (!resource) return res.status(404).json({ error: "Sheet not found." });
+  const source = resolveResourceFile(resource);
+  const suffix = crypto.randomUUID();
+  const artifacts = [
+    {
+      source,
+      quarantine: path.join(TRASH_DIR, `${suffix}-${resource.storedName}`),
+      required: true
+    },
+    {
+      source: path.join(THUMB_DIR, `${resource.id}.png`),
+      quarantine: path.join(TRASH_DIR, `${suffix}-${resource.id}.png`),
+      required: false
     }
-
-    deletedResource = resources[index];
-    resources.splice(index, 1);
-    return true;
-  }, req.adminSession.userId)
-    .then(async (result) => {
-      if (result === null) {
-        return res.status(404).json({ error: "Sheet not found." });
-      }
-
-      await removeResourceFiles(deletedResource);
-      return res.json({ ok: true });
-    })
-    .catch((error) => {
-      console.error(error);
-      return res.status(500).json({ error: "Could not delete sheet." });
+  ];
+  try {
+    const pending = resourceStore.deleteResource(req.params.id, req.adminSession.userId, artifacts);
+    if (!pending) return res.status(404).json({ error: "Sheet not found." });
+    resourceStore.finalizeDeletion(pending.operationId, req.adminSession.userId);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: "Deletion is incomplete. An administrator must run the integrity report and retry cleanup."
     });
+  }
 });
 
 app.post("/api/resources/:id/annotations", requireAuthenticated, requireSameOrigin, requireCsrf, async (req, res) => {
@@ -918,77 +956,32 @@ app.post("/api/resources/:id/annotations", requireAuthenticated, requireSameOrig
     return res.status(400).json({ error: "A page number and annotation text are required." });
   }
 
-  await updateIndex((resources) => {
-    const resource = getResourceById(resources, req.params.id);
-    if (!resource) {
-      return null;
-    }
-
-    if (!Array.isArray(resource.annotations)) {
-      resource.annotations = [];
-    }
-
-    const annotation = {
-      id: crypto.randomUUID(),
-      userId: req.adminSession.userId,
-      page,
-      text,
-      color,
-      createdAt: new Date().toISOString()
-    };
-
-    resource.annotations.push(annotation);
-    resource.updatedAt = new Date().toISOString();
-    resource.updatedBy = req.adminSession.userId;
-    return annotation;
-  }, req.adminSession.userId)
-    .then((annotation) => {
-      if (!annotation) {
-        return res.status(404).json({ error: "Sheet not found." });
-      }
-
-      return res.status(201).json({ annotation });
-    })
-    .catch((error) => {
-      console.error(error);
-      return res.status(500).json({ error: "Could not save annotation." });
-    });
+  try {
+    const annotation = resourceStore.createAnnotation(req.params.id, {
+      id: crypto.randomUUID(), page, text, color
+    }, req.adminSession.userId);
+    if (!annotation) return res.status(404).json({ error: "Sheet not found." });
+    return res.status(201).json({ annotation });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Could not save annotation." });
+  }
 });
 
 app.delete("/api/resources/:id/annotations/:annotationId", requireAuthenticated, requireSameOrigin, requireCsrf, requireAnnotationOwner, async (req, res) => {
   recordAudit(req, "resource_modification_requested", "annotation", req.params.annotationId, { operation: "annotation_delete" });
-  await updateIndex((resources) => {
-    const resource = getResourceById(resources, req.params.id);
-    if (!resource) {
-      return null;
-    }
-
-    const annotations = Array.isArray(resource.annotations) ? resource.annotations : [];
-    const nextAnnotations = annotations.filter((annotation) => annotation.id !== req.params.annotationId);
-    if (nextAnnotations.length === annotations.length) {
-      return undefined;
-    }
-
-    resource.annotations = nextAnnotations;
-    resource.updatedAt = new Date().toISOString();
-    resource.updatedBy = req.adminSession.userId;
-    return true;
-  }, req.adminSession.userId)
-    .then((result) => {
-      if (result === null) {
-        return res.status(404).json({ error: "Sheet not found." });
-      }
-
-      if (!result) {
-        return res.status(404).json({ error: "Annotation not found." });
-      }
-
-      return res.json({ ok: true });
-    })
-    .catch((error) => {
-      console.error(error);
-      return res.status(500).json({ error: "Could not delete annotation." });
-    });
+  try {
+    const result = resourceStore.deleteAnnotation(
+      req.params.id, req.params.annotationId, req.adminSession.userId,
+      req.adminSession.role === "admin"
+    );
+    if (result.status === "missing") return res.status(404).json({ error: "Annotation not found." });
+    if (result.status === "forbidden") return res.status(403).json({ error: "You cannot modify this annotation." });
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Could not delete annotation." });
+  }
 });
 
 app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, requireCsrf, upload.array("files", MAX_FILES_PER_UPLOAD), async (req, res) => {
@@ -1031,6 +1024,7 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
 
   const uploadedAt = new Date().toISOString();
   const created = [];
+  const moves = [];
 
   try {
     for (const file of files) {
@@ -1040,8 +1034,7 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
       const storageCategory = getStorageCategory(kind, extension);
       const destination = path.join(UPLOADS_DIR, storageCategory, storedName);
 
-      await fsp.rename(file.path, destination);
-      const searchIndex = await extractSearchText(destination, extension);
+      const searchIndex = await extractSearchText(file.path, extension);
       const resource = {
         id,
         title: files.length === 1 ? title : `${title} - ${file.originalname}`,
@@ -1067,14 +1060,23 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
       };
 
       created.push(resource);
-      await ensureResourceThumbnail(resource, { force: true }).catch((thumbnailError) => {
+      moves.push({ stagedPath: file.path, finalPath: destination });
+    }
+
+    const committed = resourceStore.createBatch(created, moves, req.adminSession.userId);
+    const thumbnailOperations = new Map(
+      committed.thumbnailOperations.map((item) => [item.resourceId, item.operationId])
+    );
+    for (const resource of created) {
+      const thumbnailOperationId = thumbnailOperations.get(resource.id);
+      if (!thumbnailOperationId) continue;
+      await ensureResourceThumbnail(resource, { force: true }).then(() => {
+        resourceStore.finishOperation(thumbnailOperationId);
+      }).catch((thumbnailError) => {
+        resourceStore.finishOperation(thumbnailOperationId, thumbnailError);
         console.error("Thumbnail generation failed:", thumbnailError);
       });
     }
-
-    await updateIndex((resources) => {
-      resources.push(...created);
-    }, req.adminSession.userId);
 
     res.status(201).json({ resources: created.map(publicResource) });
   } catch (error) {
@@ -1097,6 +1099,7 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
 
       const thumbnailPath = await ensureResourceThumbnail(resource, { force: true });
       if (thumbnailPath) {
+        resourceStore.finishPendingThumbnails(resource.id);
         refreshed += 1;
       }
     }
@@ -1106,6 +1109,16 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
     console.error(error);
     res.status(500).json({ error: "Could not refresh thumbnails." });
   }
+});
+
+app.get("/api/admin/integrity", requireAdmin, async (req, res) => {
+  recordAudit(req, "maintenance_requested", "catalog", null, { operation: "integrity_report" });
+  const report = await resourceStore.reportIntegrity({
+    uploadsDir: UPLOADS_DIR,
+    stagingDir: STAGING_DIR,
+    trashDir: TRASH_DIR
+  });
+  res.status(report.ok ? 200 : 409).json(report);
 });
 
 app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
@@ -1142,7 +1155,7 @@ app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
 
   try {
     if (resource.extension === ".pdf") {
-      const thumbnailPath = await ensurePdfThumbnail(resource);
+      const thumbnailPath = await ensureResourceThumbnail(resource);
       if (!thumbnailPath) {
         return res.status(404).send("Thumbnail not available.");
       }
@@ -1152,7 +1165,7 @@ app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
     }
 
     if ([".png", ".jpg", ".jpeg"].includes(resource.extension)) {
-      const thumbnailPath = await ensureImageThumbnail(resource);
+      const thumbnailPath = await ensureResourceThumbnail(resource);
       if (!thumbnailPath) {
         return res.status(404).send("Thumbnail not available.");
       }

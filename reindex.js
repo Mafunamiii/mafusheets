@@ -6,6 +6,7 @@ const {
   migrateLegacyCatalog,
   openDatabase
 } = require("./lib/database");
+const { createResourceStore } = require("./lib/resources");
 
 const ROOT = __dirname;
 const INDEX_FILE = path.join(ROOT, "data", "resources.json");
@@ -17,33 +18,30 @@ async function main() {
   const db = openDatabase(DATABASE_FILE);
   await migrateLegacyCatalog(db, INDEX_FILE);
   const catalog = createCatalogStore(db);
+  const resourceStore = createResourceStore(db);
   const resources = catalog.listResources();
   let indexed = 0;
   let skipped = 0;
 
   for (const resource of resources) {
-    if (!FORCE_ALL && typeof resource.searchText === "string") {
+    if (!FORCE_ALL && resource.indexedAt && resource.searchStatus !== "failed") {
       skipped += 1;
       continue;
     }
 
     const filePath = path.join(UPLOADS_DIR, resource.category, resource.storedName);
     const result = await extractSearchText(filePath, resource.extension);
-    resource.searchText = result.searchText;
-    resource.searchStatus = result.searchStatus;
-    resource.indexedAt = new Date().toISOString();
-    resource.sheetKind = resource.sheetKind || (resource.extension === ".pdf" ? "pdf" : [".png", ".jpg", ".jpeg"].includes(resource.extension) ? "image" : [".txt", ".md", ".docx"].includes(resource.extension) ? "chart" : "other");
-    if (!Array.isArray(resource.tags)) {
-      resource.tags = [];
+    const committed = resourceStore.updateSearchIndex(
+      resource.id, resource.updatedAt, result, MIGRATION_ACTOR_ID
+    );
+    if (committed) {
+      indexed += 1;
+      console.log(`${result.searchStatus}: ${resource.originalName}`);
+    } else {
+      skipped += 1;
+      console.log(`conflict: ${resource.originalName}`);
     }
-    if (!Array.isArray(resource.annotations)) {
-      resource.annotations = [];
-    }
-    indexed += 1;
-    console.log(`${resource.searchStatus}: ${resource.originalName}`);
   }
-
-  catalog.replaceResources(resources, MIGRATION_ACTOR_ID);
   console.log(`Done. Indexed ${indexed}, skipped ${skipped}.`);
   db.close();
 }
