@@ -3,7 +3,6 @@ const path = require("path");
 const JSZip = require("jszip");
 const mammoth = require("mammoth");
 const pdfParse = require("pdf-parse");
-const XLSX = require("xlsx");
 
 const MAX_SEARCH_TEXT_LENGTH = 500000;
 
@@ -41,26 +40,6 @@ async function extractPptxText(filePath) {
   return text.join(" ");
 }
 
-async function extractSpreadsheetText(filePath) {
-  const workbook = XLSX.readFile(filePath, {
-    cellFormula: false,
-    cellHTML: false,
-    cellNF: false,
-    cellStyles: false,
-    raw: false,
-    type: "file"
-  });
-  const text = [];
-
-  for (const sheetName of workbook.SheetNames) {
-    const sheet = workbook.Sheets[sheetName];
-    text.push(sheetName);
-    text.push(XLSX.utils.sheet_to_csv(sheet));
-  }
-
-  return text.join("\n\n");
-}
-
 async function extractPlainTextFile(filePath) {
   const raw = await fsp.readFile(filePath, "utf8");
 
@@ -84,8 +63,6 @@ async function extractSearchText(filePath, extension) {
       text = result.value || "";
     } else if (extension === ".pptx") {
       text = await extractPptxText(filePath);
-    } else if ([".xlsx", ".xls", ".csv"].includes(extension)) {
-      text = await extractSpreadsheetText(filePath);
     } else if ([".txt", ".md", ".html", ".htm"].includes(extension)) {
       text = await extractPlainTextFile(filePath);
     }

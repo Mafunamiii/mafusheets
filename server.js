@@ -5,12 +5,18 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
-const { execFile } = require("child_process");
-const { promisify } = require("util");
-const { extractSearchText, normalizeSearchText } = require("./search-indexer");
+const { fork } = require("child_process");
+const { normalizeSearchText } = require("./search-indexer");
 const { createCatalogStore, migrateLegacyCatalog, openDatabase } = require("./lib/database");
 const { createUserStore } = require("./lib/users");
 const { createResourceStore } = require("./lib/resources");
+const { createProcessingJobStore } = require("./lib/processing-jobs");
+const {
+  UploadPolicyError,
+  normalizeFilename,
+  validateDeclaredMime,
+  validateSignature
+} = require("./lib/upload-policy");
 const {
   SESSION_TTL_MS,
   auditEvent,
@@ -55,7 +61,6 @@ function loadEnvFile(filePath) {
 loadEnvFile(path.join(__dirname, ".env"));
 
 const app = express();
-const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
@@ -68,8 +73,45 @@ const THUMB_DIR = process.env.THUMB_DIR || path.join(DATA_DIR, "thumbnails");
 const INDEX_FILE = process.env.LEGACY_CATALOG_PATH || path.join(DATA_DIR, "resources.json");
 const DATABASE_FILE = process.env.DATABASE_PATH || path.join(DATA_DIR, "mafusheets.sqlite");
 const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || (process.platform === "win32" ? "pdftoppm.cmd" : "pdftoppm");
-const MAX_FILE_SIZE = 250 * 1024 * 1024;
-const MAX_FILES_PER_UPLOAD = 10;
+const PDFINFO_BIN = process.env.PDFINFO_BIN || (process.platform === "win32" ? "pdfinfo.exe" : "pdfinfo");
+
+function boundedInteger(name, defaultValue, { min, max, allowDisabled = false } = {}) {
+  const raw = process.env[name];
+  if (allowDisabled && raw === "disabled") return null;
+  const value = raw === undefined || raw === "" ? defaultValue : Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}${allowDisabled ? ', or "disabled"' : ""}.`);
+  }
+  return value;
+}
+
+const MAX_FILE_SIZE = boundedInteger("UPLOAD_MAX_FILE_BYTES", 50 * 1024 * 1024, {
+  min: 1024, max: 250 * 1024 * 1024
+});
+const MAX_REQUEST_SIZE = boundedInteger("UPLOAD_MAX_REQUEST_BYTES", 150 * 1024 * 1024, {
+  min: MAX_FILE_SIZE, max: 500 * 1024 * 1024
+});
+const MAX_FILES_PER_UPLOAD = boundedInteger("UPLOAD_MAX_FILES", 10, { min: 1, max: 20 });
+const USER_STORAGE_QUOTA = boundedInteger("UPLOAD_USER_STORAGE_BYTES", 2 * 1024 * 1024 * 1024, {
+  min: MAX_FILE_SIZE, max: 100 * 1024 * 1024 * 1024
+});
+const USER_DAILY_UPLOAD_QUOTA = boundedInteger(
+  "UPLOAD_USER_DAILY_BYTES", 500 * 1024 * 1024,
+  { min: MAX_FILE_SIZE, max: 10 * 1024 * 1024 * 1024, allowDisabled: true }
+);
+const PROCESSING_CONCURRENCY = boundedInteger("UPLOAD_WORKER_CONCURRENCY", 2, { min: 1, max: 4 });
+const USER_UPLOAD_CONCURRENCY = boundedInteger("UPLOAD_USER_CONCURRENCY", 1, { min: 1, max: 3 });
+const PROCESS_TIMEOUT_MS = boundedInteger("UPLOAD_PROCESS_TIMEOUT_MS", 30000, { min: 1000, max: 120000 });
+const REQUEST_TIMEOUT_MS = boundedInteger("UPLOAD_REQUEST_TIMEOUT_MS", 120000, {
+  min: 10000, max: 10 * 60 * 1000
+});
+const MAX_PDF_PAGES = boundedInteger("UPLOAD_MAX_PDF_PAGES", 500, { min: 1, max: 2000 });
+const MAX_IMAGE_PIXELS = boundedInteger("UPLOAD_MAX_IMAGE_PIXELS", 40_000_000, {
+  min: 1_000_000, max: 100_000_000
+});
+const STAGING_MAX_AGE_MS = boundedInteger("UPLOAD_STAGING_MAX_AGE_MS", 24 * 60 * 60 * 1000, {
+  min: 60 * 60 * 1000, max: 7 * 24 * 60 * 60 * 1000
+});
 const SESSION_COOKIE = "mafusheets_admin";
 const SESSION_SECRET = requireSessionSecret(process.env.SESSION_SECRET);
 let database;
@@ -77,7 +119,15 @@ let catalogStore;
 let userStore;
 let sessionStore;
 let resourceStore;
+let processingJobStore;
 let startupIntegrityReport = null;
+let processingActive = 0;
+let processingScheduled = false;
+let shuttingDown = false;
+const activeUploads = new Map();
+const activeStagingPaths = new Set();
+const validationWaiters = [];
+let validationActive = 0;
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -142,9 +192,14 @@ const mimeTypes = {
 
 const upload = multer({
   dest: STAGING_DIR,
+  preservePath: true,
   limits: {
     fileSize: MAX_FILE_SIZE,
-    files: MAX_FILES_PER_UPLOAD
+    files: MAX_FILES_PER_UPLOAD,
+    fields: 12,
+    parts: MAX_FILES_PER_UPLOAD + 12,
+    fieldNameSize: 80,
+    fieldSize: 16 * 1024
   }
 });
 
@@ -189,6 +244,8 @@ async function ensureStorage() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
   await fsp.mkdir(TMP_DIR, { recursive: true });
   await fsp.mkdir(STAGING_DIR, { recursive: true });
+  await fsp.chmod(TMP_DIR, 0o700);
+  await fsp.chmod(STAGING_DIR, 0o700);
   await fsp.mkdir(TRASH_DIR, { recursive: true });
   await fsp.mkdir(THUMB_DIR, { recursive: true });
   await Promise.all(
@@ -196,11 +253,18 @@ async function ensureStorage() {
       fsp.mkdir(path.join(UPLOADS_DIR, category), { recursive: true })
     )
   );
+  await fsp.chmod(UPLOADS_DIR, 0o700);
+  await Promise.all(["documents", "photos", "slides"].map((category) =>
+    fsp.chmod(path.join(UPLOADS_DIR, category), 0o700)
+  ));
 
   database = openDatabase(DATABASE_FILE);
   await migrateLegacyCatalog(database, INDEX_FILE);
   catalogStore = createCatalogStore(database);
   resourceStore = createResourceStore(database);
+  processingJobStore = createProcessingJobStore(database);
+  processingJobStore.recoverInterrupted();
+  processingJobStore.enqueueMissing();
   userStore = createUserStore(database);
   sessionStore = createSessionStore(database, SESSION_SECRET);
   sessionStore.purgeExpired();
@@ -212,6 +276,8 @@ async function ensureStorage() {
   if (!startupIntegrityReport.ok) {
     console.error(`Startup integrity check found ${startupIntegrityReport.issues.length} issue(s). Run "npm run integrity".`);
   }
+  await cleanupStaleStaging();
+  scheduleProcessing();
 }
 
 function parseCookies(req) {
@@ -613,99 +679,251 @@ function resolveResourceFile(resource) {
   const resolved = path.resolve(filePath);
   const categoryDir = path.resolve(path.join(UPLOADS_DIR, resource.category));
 
-  if (!resolved.startsWith(categoryDir)) {
+  const relative = path.relative(categoryDir, resolved);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || relative.includes(path.sep)) {
     return null;
   }
 
   return resolved;
 }
 
-async function ensurePdfThumbnail(resource, { force = false } = {}) {
-  const sourcePath = resolveResourceFile(resource);
-  if (!sourcePath || resource.extension !== ".pdf") {
-    return null;
-  }
-
-  const thumbnailPath = path.join(THUMB_DIR, `${resource.id}.png`);
-  try {
-    const [sourceStat, thumbnailStat] = await Promise.all([
-      fsp.stat(sourcePath),
-      fsp.stat(thumbnailPath).catch(() => null)
-    ]);
-
-    if (!force && thumbnailStat && thumbnailStat.mtimeMs >= sourceStat.mtimeMs) {
-      return thumbnailPath;
-    }
-  } catch {
-    return null;
-  }
-
-  const temporaryPrefix = path.join(THUMB_DIR, `.${resource.id}-${crypto.randomUUID()}`);
-  await execFileAsync(PDFTOPPM_BIN, [
-    "-f", "1",
-    "-l", "1",
-    "-png",
-    "-singlefile",
-    "-scale-to-x", "520",
-    "-scale-to-y", "-1",
-    sourcePath,
-    temporaryPrefix
-  ], { timeout: 30000, windowsHide: true, shell: process.platform === "win32" });
-  await fsp.rename(`${temporaryPrefix}.png`, thumbnailPath);
-  return thumbnailPath;
+async function removeTempFiles(files) {
+  await Promise.all(
+    (files || []).map(async (file) => {
+      activeStagingPaths.delete(file.path);
+      await fsp.unlink(file.path).catch(() => undefined);
+    })
+  );
 }
 
-async function ensureImageThumbnail(resource, { force = false } = {}) {
-  const sourcePath = resolveResourceFile(resource);
-  if (!sourcePath || ![".png", ".jpg", ".jpeg"].includes(resource.extension)) {
-    return null;
+async function cleanupStaleStaging({ now = Date.now() } = {}) {
+  let removed = 0;
+  const entries = await fsp.readdir(STAGING_DIR, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const filePath = path.join(STAGING_DIR, entry.name);
+    if (activeStagingPaths.has(filePath)) continue;
+    const stat = await fsp.lstat(filePath).catch(() => null);
+    if (!stat || !stat.isFile() || stat.isSymbolicLink()) continue;
+    if (now - stat.mtimeMs < STAGING_MAX_AGE_MS) continue;
+    await fsp.unlink(filePath).then(() => { removed += 1; }).catch(() => undefined);
   }
-
-  const thumbnailPath = path.join(THUMB_DIR, `${resource.id}.png`);
-  try {
-    const [sourceStat, thumbnailStat] = await Promise.all([
-      fsp.stat(sourcePath),
-      fsp.stat(thumbnailPath).catch(() => null)
-    ]);
-
-    if (!force && thumbnailStat && thumbnailStat.mtimeMs >= sourceStat.mtimeMs) {
-      return thumbnailPath;
-    }
-  } catch {
-    return null;
-  }
-
-  const temporaryPath = path.join(THUMB_DIR, `.${resource.id}-${crypto.randomUUID()}.tmp`);
-  await fsp.copyFile(sourcePath, temporaryPath);
-  try {
-    await fsp.rename(temporaryPath, thumbnailPath);
-  } catch (error) {
-    await fsp.unlink(temporaryPath).catch(() => undefined);
-    throw error;
-  }
-  return thumbnailPath;
+  return removed;
 }
 
-async function ensureResourceThumbnail(resource, options = {}) {
-  const owner = crypto.randomUUID();
-  const release = resourceStore
-    ? resourceStore.acquireLock(`resource:${resource.id}`, owner, 60000)
-    : () => {};
+function acquireValidationSlot() {
+  if (validationActive < PROCESSING_CONCURRENCY) {
+    validationActive += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => validationWaiters.push(resolve));
+}
+
+function releaseValidationSlot() {
+  const next = validationWaiters.shift();
+  if (next) next();
+  else validationActive -= 1;
+}
+
+function workerLimits() {
+  return {
+    childOutputBytes: 64 * 1024,
+    maxArchiveEntries: 2000,
+    maxArchiveExpandedBytes: Math.min(MAX_REQUEST_SIZE, 100 * 1024 * 1024),
+    maxImagePixels: MAX_IMAGE_PIXELS,
+    maxPdfPages: MAX_PDF_PAGES,
+    pdfInfoBin: PDFINFO_BIN,
+    pdfToPpmBin: PDFTOPPM_BIN,
+    processTimeoutMs: PROCESS_TIMEOUT_MS
+  };
+}
+
+async function runIsolated(message, timeoutMs = PROCESS_TIMEOUT_MS) {
+  await acquireValidationSlot();
   try {
-    if (resource.extension === ".pdf") return ensurePdfThumbnail(resource, options);
-    if ([".png", ".jpg", ".jpeg"].includes(resource.extension)) {
-      return ensureImageThumbnail(resource, options);
-    }
-    return null;
+    return await new Promise((resolve, reject) => {
+      const child = fork(path.join(ROOT, "processing-worker.js"), [], {
+        cwd: TMP_DIR,
+        env: {
+          NODE_ENV: "production",
+          PATH: process.env.PATH || ""
+        },
+        execArgv: ["--max-old-space-size=192"],
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        windowsHide: true
+      });
+      let settled = false;
+      const finish = (error, result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve(result);
+      };
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        finish(new Error("Processing timed out."));
+      }, timeoutMs);
+      child.once("error", (error) => finish(error));
+      child.once("exit", (code, signal) => {
+        if (!settled) finish(new Error(`Worker stopped unexpectedly (${signal || code}).`));
+      });
+      child.once("message", (response) => {
+        if (response && response.ok) finish(null, response.result);
+        else finish(new Error(response && response.error || "Worker rejected the file."));
+      });
+      child.send({ ...message, limits: workerLimits() });
+    });
   } finally {
+    releaseValidationSlot();
+  }
+}
+
+async function validateUploadedFiles(files, kind) {
+  let total = 0;
+  for (const file of files) {
+    activeStagingPaths.add(file.path);
+    const normalized = normalizeFilename(file.originalname);
+    file.safeOriginalName = normalized.originalName;
+    file.safeExtension = normalized.extension;
+    if (!isAllowedForKind(kind, normalized.extension)) {
+      throw new UploadPolicyError(`The file "${normalized.originalName}" is not allowed for this sheet type.`);
+    }
+    validateDeclaredMime(normalized.extension, file.mimetype);
+    if (file.size > MAX_FILE_SIZE) throw new UploadPolicyError("A file exceeds the configured size limit.", 413);
+    total += file.size;
+    if (total > MAX_REQUEST_SIZE) {
+      throw new UploadPolicyError("The combined upload exceeds the configured request limit.", 413, "BATCH_SIZE");
+    }
+  }
+  for (const file of files) {
+    await validateSignature(file.path, file.safeExtension, { maxImagePixels: MAX_IMAGE_PIXELS });
+    await runIsolated({
+      action: "validate",
+      filePath: file.path,
+      extension: file.safeExtension
+    });
+  }
+  return total;
+}
+
+function userUsage(userId) {
+  const stored = database.prepare(`
+    SELECT COALESCE(SUM(f.size), 0) bytes
+    FROM resources r JOIN resource_files f ON f.resource_id=r.id
+    WHERE r.uploaded_by=? AND r.deleted_at IS NULL
+  `).get(userId).bytes;
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const daily = database.prepare(`
+    SELECT COALESCE(SUM(bytes), 0) bytes FROM upload_usage
+    WHERE user_id=? AND occurred_at>=?
+  `).get(userId, since).bytes;
+  return { stored, daily };
+}
+
+function enforceUserQuota(actorUserId, incomingBytes, { storageUserId = actorUserId, replacedBytes = 0 } = {}) {
+  const storageUsage = userUsage(storageUserId);
+  const actorUsage = storageUserId === actorUserId ? storageUsage : userUsage(actorUserId);
+  if (storageUsage.stored - replacedBytes + incomingBytes > USER_STORAGE_QUOTA) {
+    throw new UploadPolicyError("Your storage quota would be exceeded.", 413, "STORAGE_QUOTA");
+  }
+  if (USER_DAILY_UPLOAD_QUOTA !== null && actorUsage.daily + incomingBytes > USER_DAILY_UPLOAD_QUOTA) {
+    throw new UploadPolicyError("Your daily upload allowance would be exceeded.", 429, "DAILY_QUOTA");
+  }
+}
+
+function enforceRequestLength(req, res, next) {
+  const raw = req.get("content-length");
+  if (raw) {
+    const length = Number(raw);
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_REQUEST_SIZE) {
+      return res.status(413).json({ error: "The upload request exceeds the configured size limit." });
+    }
+  }
+  return next();
+}
+
+function limitConcurrentUserUploads(req, res, next) {
+  const userId = req.adminSession.userId;
+  const count = activeUploads.get(userId) || 0;
+  if (count >= USER_UPLOAD_CONCURRENCY) {
+    return res.status(429).json({ error: "Another upload for this account is already in progress." });
+  }
+  activeUploads.set(userId, count + 1);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    const current = activeUploads.get(userId) || 1;
+    if (current <= 1) activeUploads.delete(userId);
+    else activeUploads.set(userId, current - 1);
+  };
+  res.once("finish", release);
+  res.once("close", release);
+  next();
+}
+
+async function executeProcessingJob(job) {
+  const resource = getResourceById(await readIndex(), job.resource_id);
+  if (!resource) throw new Error("Resource no longer exists.");
+  const lockOwner = crypto.randomUUID();
+  const release = resourceStore.acquireLock(
+    `resource:${resource.id}`, lockOwner, PROCESS_TIMEOUT_MS + 30000
+  );
+  const temporaryThumbnail = path.join(THUMB_DIR, `.${resource.id}-${crypto.randomUUID()}`);
+  try {
+    const filePath = resolveResourceFile(resource);
+    if (!filePath) throw new Error("Resource path is invalid.");
+    const thumbnailPath = path.join(THUMB_DIR, `${resource.id}.png`);
+    const result = await runIsolated({
+      action: "process",
+      extension: resource.extension,
+      filePath,
+      thumbnailPath: temporaryThumbnail
+    }, PROCESS_TIMEOUT_MS);
+    resourceStore.updateSearchIndex(
+      resource.id, resource.updatedAt,
+      { searchText: result.searchText, searchStatus: result.searchStatus },
+      job.actor_user_id
+    );
+    if (result.generatedThumbnail) {
+      await fsp.rename(result.generatedThumbnail, thumbnailPath);
+      resourceStore.finishPendingThumbnails(resource.id);
+    }
+  } catch (error) {
+    throw error;
+  } finally {
+    await Promise.all([
+      fsp.unlink(`${temporaryThumbnail}.worker.png`).catch(() => undefined),
+      fsp.unlink(`${temporaryThumbnail}.worker.png.png`).catch(() => undefined)
+    ]);
     release();
   }
 }
 
-async function removeTempFiles(files) {
-  await Promise.all(
-    (files || []).map((file) => fsp.unlink(file.path).catch(() => undefined))
-  );
+function scheduleProcessing() {
+  if (!processingJobStore || processingScheduled || shuttingDown) return;
+  processingScheduled = true;
+  setImmediate(async () => {
+    processingScheduled = false;
+    while (processingActive < PROCESSING_CONCURRENCY && !shuttingDown) {
+      const job = processingJobStore.next();
+      if (!job) break;
+      processingActive += 1;
+      executeProcessingJob(job)
+        .then(() => processingJobStore.succeed(job.id))
+        .catch((error) => processingJobStore.fail(job.id, error))
+        .finally(() => {
+          processingActive -= 1;
+          scheduleProcessing();
+        });
+    }
+  });
+}
+
+function enqueueProcessing(resource, actorUserId) {
+  processingJobStore.enqueue(resource.id, actorUserId, 2);
+  scheduleProcessing();
 }
 
 app.get("/", allowPublic, (req, res) => {
@@ -862,53 +1080,57 @@ app.post(
   requireSameOrigin,
   requireCsrf,
   requireResourceEditor,
+  limitConcurrentUserUploads,
+  enforceRequestLength,
   upload.single("file"),
   async (req, res) => {
     const file = req.file;
     if (!file) return res.status(400).json({ error: "Choose a replacement file." });
     const current = req.authorizedResource;
     const kind = normalizeKind(req.body.kind) || current.sheetKind;
-    const extension = path.extname(file.originalname || "").toLowerCase();
-    if (!isAllowedForKind(kind, extension)) {
-      await removeTempFiles([file]);
-      return res.status(400).json({ error: "The replacement file type is not allowed." });
-    }
+    let extension;
     const id = crypto.randomUUID();
-    const category = getStorageCategory(kind, extension);
-    const storedName = `${Date.now()}-${id}${extension}`;
-    const finalPath = path.join(UPLOADS_DIR, category, storedName);
     const originalPath = resolveResourceFile(current);
-    const backupPath = path.join(TRASH_DIR, `replacement-${id}-${current.storedName}`);
     try {
-      const search = await extractSearchText(file.path, extension);
+      const total = await validateUploadedFiles([file], kind);
+      enforceUserQuota(req.adminSession.userId, total, {
+        storageUserId: current.uploadedBy,
+        replacedBytes: current.size
+      });
+      extension = file.safeExtension;
+      const category = getStorageCategory(kind, extension);
+      const storedName = `${Date.now()}-${id}${extension}`;
+      const finalPath = path.join(UPLOADS_DIR, category, storedName);
+      const backupPath = path.join(TRASH_DIR, `replacement-${id}-${path.basename(current.storedName)}`);
       const result = resourceStore.replaceFile(req.params.id, {
         stagedPath: file.path,
         finalPath,
         originalPath,
         backupPath,
         category,
-        originalName: file.originalname,
+        originalName: file.safeOriginalName,
         storedName,
         extension,
         size: file.size,
         sheetKind: sheetKindForExtension(extension),
-        searchText: search.searchText,
-        searchStatus: search.searchStatus
+        searchText: "",
+        searchStatus: "pending"
       }, req.adminSession.userId);
       if (!result) {
         await removeTempFiles([file]);
         return res.status(404).json({ error: "Sheet not found." });
       }
+      activeStagingPaths.delete(file.path);
       await fsp.unlink(path.join(THUMB_DIR, `${current.id}.png`)).catch(() => undefined);
       const updated = getResourceById(await readIndex(), req.params.id);
-      await ensureResourceThumbnail(updated, { force: true }).catch((error) => {
-        resourceStore.finishOperation(result.thumbnailOperationId, error);
-      });
-      if (result.thumbnailOperationId) resourceStore.finishOperation(result.thumbnailOperationId);
+      enqueueProcessing(updated, req.adminSession.userId);
       return res.json({ resource: fullResource(updated) });
     } catch (error) {
       await removeTempFiles([file]);
       console.error(error);
+      if (error instanceof UploadPolicyError) {
+        return res.status(error.status).json({ error: error.message });
+      }
       return res.status(500).json({ error: "Replacement failed; the original file was retained." });
     }
   }
@@ -984,7 +1206,16 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAuthenticated,
   }
 });
 
-app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, requireCsrf, upload.array("files", MAX_FILES_PER_UPLOAD), async (req, res) => {
+app.post(
+  "/api/upload",
+  uploadLimiter,
+  requireAuthenticated,
+  requireSameOrigin,
+  requireCsrf,
+  limitConcurrentUserUploads,
+  enforceRequestLength,
+  upload.array("files", MAX_FILES_PER_UPLOAD),
+  async (req, res) => {
   recordAudit(req, "resource_modification_requested", "resource", null, { operation: "upload" });
   const kind = normalizeKind(req.body.kind);
   const title = cleanText(req.body.title);
@@ -1010,34 +1241,23 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
     return res.status(400).json({ error: "Choose at least one file." });
   }
 
-  const invalidFile = files.find((file) => {
-    const extension = path.extname(file.originalname || "").toLowerCase();
-    return !isAllowedForKind(kind, extension);
-  });
-
-  if (invalidFile) {
-    await removeTempFiles(files);
-    return res.status(400).json({
-      error: `The file "${invalidFile.originalname}" is not allowed for ${uploadKinds[kind].label}.`
-    });
-  }
-
   const uploadedAt = new Date().toISOString();
   const created = [];
   const moves = [];
 
   try {
+    const totalBytes = await validateUploadedFiles(files, kind);
+    enforceUserQuota(req.adminSession.userId, totalBytes);
     for (const file of files) {
-      const extension = path.extname(file.originalname).toLowerCase();
+      const extension = file.safeExtension;
       const id = crypto.randomUUID();
       const storedName = `${Date.now()}-${id}${extension}`;
       const storageCategory = getStorageCategory(kind, extension);
       const destination = path.join(UPLOADS_DIR, storageCategory, storedName);
 
-      const searchIndex = await extractSearchText(file.path, extension);
       const resource = {
         id,
-        title: files.length === 1 ? title : `${title} - ${file.originalname}`,
+        title: files.length === 1 ? title : `${title} - ${file.safeOriginalName}`,
         artist,
         key,
         capo,
@@ -1046,16 +1266,16 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
         tags,
         category: storageCategory,
         sheetKind: sheetKindForExtension(extension),
-        originalName: file.originalname,
+        originalName: file.safeOriginalName,
         storedName,
         extension,
         size: file.size,
         uploadedAt,
         uploadedBy: req.adminSession.userId,
         updatedBy: req.adminSession.userId,
-        searchText: searchIndex.searchText,
-        searchStatus: searchIndex.searchStatus,
-        indexedAt: new Date().toISOString(),
+        searchText: "",
+        searchStatus: "pending",
+        indexedAt: null,
         annotations: []
       };
 
@@ -1063,25 +1283,19 @@ app.post("/api/upload", uploadLimiter, requireAuthenticated, requireSameOrigin, 
       moves.push({ stagedPath: file.path, finalPath: destination });
     }
 
-    const committed = resourceStore.createBatch(created, moves, req.adminSession.userId);
-    const thumbnailOperations = new Map(
-      committed.thumbnailOperations.map((item) => [item.resourceId, item.operationId])
-    );
+    resourceStore.createBatch(created, moves, req.adminSession.userId);
+    for (const file of files) activeStagingPaths.delete(file.path);
     for (const resource of created) {
-      const thumbnailOperationId = thumbnailOperations.get(resource.id);
-      if (!thumbnailOperationId) continue;
-      await ensureResourceThumbnail(resource, { force: true }).then(() => {
-        resourceStore.finishOperation(thumbnailOperationId);
-      }).catch((thumbnailError) => {
-        resourceStore.finishOperation(thumbnailOperationId, thumbnailError);
-        console.error("Thumbnail generation failed:", thumbnailError);
-      });
+      enqueueProcessing(resource, req.adminSession.userId);
     }
 
     res.status(201).json({ resources: created.map(publicResource) });
   } catch (error) {
     await removeTempFiles(files);
     console.error(error);
+    if (error instanceof UploadPolicyError) {
+      return res.status(error.status).json({ error: error.message });
+    }
     res.status(500).json({ error: "Upload failed. Please try again." });
   }
 });
@@ -1097,11 +1311,8 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
         continue;
       }
 
-      const thumbnailPath = await ensureResourceThumbnail(resource, { force: true });
-      if (thumbnailPath) {
-        resourceStore.finishPendingThumbnails(resource.id);
-        refreshed += 1;
-      }
+      enqueueProcessing(resource, req.adminSession.userId);
+      refreshed += 1;
     }
 
     res.json({ ok: true, refreshed });
@@ -1109,6 +1320,16 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
     console.error(error);
     res.status(500).json({ error: "Could not refresh thumbnails." });
   }
+});
+
+app.post("/api/admin/staging/cleanup", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
+  recordAudit(req, "maintenance_requested", "catalog", null, { operation: "staging_cleanup" });
+  const removed = await cleanupStaleStaging();
+  res.json({ ok: true, removed });
+});
+
+app.get("/api/admin/processing", requireAdmin, async (_req, res) => {
+  res.json({ jobs: processingJobStore.counts(), active: processingActive });
 });
 
 app.get("/api/admin/integrity", requireAdmin, async (req, res) => {
@@ -1154,27 +1375,13 @@ app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
   }
 
   try {
-    if (resource.extension === ".pdf") {
-      const thumbnailPath = await ensureResourceThumbnail(resource);
-      if (!thumbnailPath) {
-        return res.status(404).send("Thumbnail not available.");
-      }
-
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      return res.type("png").sendFile(thumbnailPath);
+    const thumbnailPath = path.join(THUMB_DIR, `${resource.id}.png`);
+    const stat = await fsp.lstat(thumbnailPath).catch(() => null);
+    if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+      return res.status(404).send("Thumbnail is still processing or unavailable.");
     }
-
-    if ([".png", ".jpg", ".jpeg"].includes(resource.extension)) {
-      const thumbnailPath = await ensureResourceThumbnail(resource);
-      if (!thumbnailPath) {
-        return res.status(404).send("Thumbnail not available.");
-      }
-
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      return res.type(mimeTypes[resource.extension] || "application/octet-stream").sendFile(thumbnailPath);
-    }
-
-    return res.status(404).send("Thumbnail not available.");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    return res.type("png").sendFile(thumbnailPath);
   } catch (error) {
     console.error("Thumbnail generation failed:", error);
     res.status(500).send("Thumbnail generation failed.");
@@ -1210,7 +1417,7 @@ app.use((error, _req, res, next) => {
 
   if (error instanceof multer.MulterError) {
     if (error.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({ error: "One of the files is over the 250 MB limit." });
+      return res.status(413).json({ error: `One of the files is over the ${MAX_FILE_SIZE} byte limit.` });
     }
 
     if (error.code === "LIMIT_FILE_COUNT") {
@@ -3968,9 +4175,11 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
 
 ensureStorage()
   .then(() => {
-    app.listen(PORT, HOST, () => {
+    const server = app.listen(PORT, HOST, () => {
       console.log(`MafuSheets running on http://${HOST}:${PORT}`);
     });
+    server.requestTimeout = REQUEST_TIMEOUT_MS;
+    server.headersTimeout = Math.min(60000, REQUEST_TIMEOUT_MS);
   })
   .catch((error) => {
     console.error('Failed to prepare storage:', error);
