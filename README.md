@@ -40,13 +40,15 @@ passwords through `MAFUSHEETS_NEW_PASSWORD`. Password resets revoke active sessi
 the user to change the temporary password unless `--no-required-change` is explicitly supplied.
 The final enabled administrator cannot be disabled or demoted.
 
-## Run with Docker Compose
+## Run with Docker Compose locally
 
 ```bash
 docker compose up --build
 ```
 
-Compose also reads the same `.env` file, so the same values work in both local and container runs.
+The production Compose file requires HTTPS certificates and is intentionally not a plain-HTTP
+development stack. Copy `.env.production.example` to a protected `.env`, supply real values, and
+follow the production deployment section below.
 
 The admin panel also includes a "Refresh thumbnails" action for older entries that were created before thumbnails were generated automatically.
 
@@ -97,26 +99,131 @@ upload policy; existing spreadsheet resources now retain their files but no long
 spreadsheet search text during reindexing.
 
 
-## Deployment
+## Production deployment
 
-The repository includes a portable `deploy.sh` that defaults to:
+The supported production baseline is Docker Compose with nginx as the only published service:
 
-- values from `.env`
+```text
+browser --HTTPS--> nginx --private Docker network--> Node
+```
 
-Examples:
+Node has no host port. nginx publishes HTTP only to redirect it to HTTPS and publishes the HTTPS
+endpoint on `HTTPS_BIND_IP`. Set this to `0.0.0.0` for an ordinary public host, `127.0.0.1` when
+another local ingress owns the public socket, or a specific Tailscale/private address. Regardless
+of address choice, browsers connect to nginx over HTTPS. Do not expose the Node container port.
+
+The proxy network is fixed at `172.30.0.0/24`; Express trusts forwarded protocol and client
+information only from nginx's fixed `172.30.0.20` address. If the subnet or proxy address changes,
+update Compose IPAM and `TRUST_PROXY` together. nginx replaces rather than appends inbound
+forwarding headers, preventing clients from supplying a forged address chain. `PUBLIC_ORIGIN` must
+be the canonical HTTPS origin.
+
+Prepare production configuration:
 
 ```bash
-./deploy.sh
-./deploy.sh --skip-install
+cp .env.production.example .env
+chmod 600 .env
+# Replace every placeholder, then verify:
+./deploy.sh --verify
+```
+
+The TLS private key should be readable by nginx's container UID 101 without becoming
+world-readable. Where certificate-management permissions make that impractical, provision a
+root-owned, narrowly readable deployment copy rather than weakening the original key.
+
+The Compose stack uses:
+
+- a non-root Node runtime (UID/GID 1000);
+- a non-root nginx runtime (UID/GID 101);
+- read-only container root filesystems;
+- dropped capabilities and `no-new-privileges`;
+- explicit database, upload, thumbnail, staging, and quarantine volumes;
+- bounded `/tmp` and nginx cache tmpfs mounts;
+- CPU, memory, and PID limits;
+- a one-shot storage initializer that grants only the application UID mode `0700` access;
+- liveness and deeper readiness probes.
+
+SQLite files, WAL/SHM files, migration backups, uploads, thumbnails, staging, and quarantine data
+remain inside their dedicated volumes. Back up the database volume and uploads together. Backup
+files created by maintenance commands inherit the private database directory and are explicitly
+set read-only by the application. Runtime logging goes only to stdout/stderr; no writable
+application log directory is required. Configure the container runtime's log rotation.
+
+Existing root-owned Docker volumes must be started through `docker compose up`; the `storage-init`
+service changes only the five named storage volumes to UID/GID 1000 and mode `0700`. Take a backup
+before the first migration. The previous PM2 deployment is no longer the secure production
+baseline because its external proxy, Node version, port exposure, and filesystem permissions were
+not repository-controlled.
+
+The image follows the supported Node 22 LTS major line. Rebuild regularly to receive Node and
+Alpine security patches; review and deliberately update the major tag when moving to a newer LTS.
+Production dependencies are installed reproducibly with `npm ci --omit=dev`.
+
+### HTTPS and browser security
+
+nginx redirects HTTP with status 308, accepts TLS 1.2/1.3, and initially emits HSTS for one day.
+It deliberately does not use `includeSubDomains` or `preload`. Increase the duration only after
+confirming HTTPS operation and certificate renewal. Production startup requires secure session
+cookies. Cookies remain `HttpOnly`, `SameSite=Lax`, host-only, scoped to `/`, and expire after
+twelve hours. Session and CSRF tokens are never placed in URLs or browser storage.
+
+State-changing routes retain the Batch 2 session-bound `X-CSRF-Token` validation and same-origin
+check. Correct forwarded HTTPS recognition is therefore required and is covered by tests.
+
+nginx accepts at most 157,286,400 bytes, matching `UPLOAD_MAX_REQUEST_BYTES`, and streams request
+bodies to avoid unbounded proxy temporary files. If the application limit changes, update
+`client_max_body_size` in `nginx/nginx.conf` in the same change. Authenticated HTML, APIs, files,
+and thumbnails are never publicly cached. Thumbnails use a five-minute private browser cache;
+static logos use a one-hour public cache.
+
+Dotfiles, environment files, databases, backups, source maps, storage paths, staging paths, and
+the deeper `/ready` endpoint are blocked at nginx. Application admin routes remain available only
+through their existing authenticated role and CSRF controls.
+
+### Health checks
+
+`/health` is a minimal process liveness endpoint. The internal `/ready` endpoint verifies:
+
+- a live SQLite query;
+- safe create/fsync/delete probes in the database, upload, thumbnail, staging, and quarantine
+  directories;
+- executable `pdfinfo` and `pdftoppm` dependencies;
+- presence of the isolated worker program;
+- the startup integrity result.
+
+The probes use unique mode-`0600` empty files and remove them immediately; they never touch user
+content. nginx does not expose `/ready`. A missing dependency, read-only storage volume, database
+failure, or startup integrity problem makes readiness return HTTP 503.
+
+### Verification and deployment
+
+`./deploy.sh` performs verification by default and never deploys without `--apply`. Verification
+checks required settings, certificate readability, Compose validity, and Dockerfile build checks.
+For a deliberate remote update:
+
+```bash
+./deploy.sh --verify
+./deploy.sh --apply
 ./deploy.sh --pull
 ```
 
-If you want to override any setting, export it before running the script or pass a different `ENV_FILE`:
+After startup, verify the deployed endpoint:
 
 ```bash
-REMOTE_HOST=deploy@159.223.66.236 APP_NAME=mafusheets ./deploy.sh
-ENV_FILE=.env.production ./deploy.sh
+curl -I http://HOST/                         # 308 to https://
+curl -k https://HOST/health                  # 200
+docker compose ps                            # app and nginx healthy
+docker compose exec mafusheets id            # uid=1000
+docker compose exec mafusheets sh -c 'test ! -w /app/server.js'
+docker compose exec mafusheets wget -qO- http://127.0.0.1:3000/ready
+./scripts/verify-running.sh
 ```
+
+Confirm from a separate host that only the configured nginx ports are reachable; port 3000 must
+not be reachable. Test login through HTTPS and inspect `Set-Cookie` for `Secure`, `HttpOnly`,
+`SameSite=Lax`, `Path=/`, and the twelve-hour lifetime. Also confirm that `/.env`,
+`/data/mafusheets.sqlite`, `/backup.sqlite`, `/app.js.map`, and `/ready` return 404, and that an
+oversized request receives 413.
 
 ## Storage
 

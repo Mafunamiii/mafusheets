@@ -59,21 +59,42 @@ function loadEnvFile(filePath) {
 }
 
 loadEnvFile(path.join(__dirname, ".env"));
+process.umask(0o077);
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, "data");
+const DATABASE_FILE = process.env.DATABASE_PATH || path.join(ROOT, "data", "mafusheets.sqlite");
+const DATA_DIR = process.env.DATA_DIR ||
+  (process.env.DATABASE_PATH ? path.dirname(DATABASE_FILE) : path.join(ROOT, "data"));
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(ROOT, "uploads");
 const TMP_DIR = process.env.TMP_DIR || path.join(ROOT, ".tmp");
 const STAGING_DIR = path.join(TMP_DIR, "staging");
 const TRASH_DIR = process.env.QUARANTINE_DIR || path.join(DATA_DIR, "quarantine");
 const THUMB_DIR = process.env.THUMB_DIR || path.join(DATA_DIR, "thumbnails");
 const INDEX_FILE = process.env.LEGACY_CATALOG_PATH || path.join(DATA_DIR, "resources.json");
-const DATABASE_FILE = process.env.DATABASE_PATH || path.join(DATA_DIR, "mafusheets.sqlite");
 const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || (process.platform === "win32" ? "pdftoppm.cmd" : "pdftoppm");
 const PDFINFO_BIN = process.env.PDFINFO_BIN || (process.platform === "win32" ? "pdfinfo.exe" : "pdfinfo");
+const REQUIRE_HTTPS = process.env.REQUIRE_HTTPS === "1";
+const COOKIE_SECURE = process.env.COOKIE_SECURE === "1";
+const PUBLIC_ORIGIN = String(process.env.PUBLIC_ORIGIN || "").replace(/\/+$/, "");
+const TRUST_PROXY = String(process.env.TRUST_PROXY || "").trim();
+let parsedPublicOrigin = null;
+try {
+  parsedPublicOrigin = PUBLIC_ORIGIN ? new URL(PUBLIC_ORIGIN) : null;
+} catch {}
+
+if (REQUIRE_HTTPS && !COOKIE_SECURE) {
+  throw new Error("COOKIE_SECURE=1 is required when REQUIRE_HTTPS=1.");
+}
+if (
+  REQUIRE_HTTPS &&
+  (!parsedPublicOrigin || parsedPublicOrigin.protocol !== "https:" ||
+   parsedPublicOrigin.origin !== PUBLIC_ORIGIN)
+) {
+  throw new Error("PUBLIC_ORIGIN must be an https:// origin without a path when REQUIRE_HTTPS=1.");
+}
 
 function boundedInteger(name, defaultValue, { min, max, allowDisabled = false } = {}) {
   const raw = process.env[name];
@@ -211,7 +232,9 @@ const uploadLimiter = rateLimit({
   message: { error: "Too many uploads. Please wait a bit and try again." }
 });
 
-app.set("trust proxy", 1);
+if (TRUST_PROXY) {
+  app.set("trust proxy", TRUST_PROXY);
+}
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 const allowPublic = (_req, _res, next) => next();
@@ -225,7 +248,17 @@ app.use((req, res, next) => {
     "Content-Security-Policy",
     "default-src 'self'; base-uri 'self'; frame-ancestors 'self'; object-src 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src 'self'"
   );
+  if (req.path.startsWith("/api/") || req.path === "/" || req.path === "/login" ||
+      req.path.startsWith("/files/") || req.path.startsWith("/sheets/")) {
+    res.setHeader("Cache-Control", "private, no-store");
+  }
   next();
+});
+app.use((req, res, next) => {
+  if (!REQUIRE_HTTPS || req.secure || req.path === "/health" || req.path === "/ready") {
+    return next();
+  }
+  return res.redirect(308, `${PUBLIC_ORIGIN}${req.originalUrl}`);
 });
 
 app.get("/assets/logo.png", allowPublic, (_req, res) => {
@@ -349,7 +382,7 @@ function setSessionCookie(res, token) {
     "Max-Age=" + Math.floor(SESSION_TTL_MS / 1000)
   ];
 
-  if (process.env.COOKIE_SECURE === "1") {
+  if (COOKIE_SECURE) {
     attrs.push("Secure");
   }
 
@@ -365,7 +398,7 @@ function clearSessionCookie(res) {
     "Max-Age=0"
   ];
 
-  if (process.env.COOKIE_SECURE === "1") {
+  if (COOKIE_SECURE) {
     attrs.push("Secure");
   }
 
@@ -477,6 +510,21 @@ function auditRejected(req, reason, entityType = "route", entityId = null) {
     method: req.method,
     path: req.route ? req.route.path : req.path
   });
+}
+
+function safeLogError(context, error) {
+  const code = error && typeof error.code === "string" ? error.code : "";
+  const name = error && typeof error.name === "string" ? error.name : "Error";
+  const raw = String(error && error.message || "operation failed");
+  const redacted = raw
+    .replaceAll(ROOT, "[app]")
+    .replaceAll(DATA_DIR, "[data]")
+    .replaceAll(UPLOADS_DIR, "[uploads]")
+    .replaceAll(TMP_DIR, "[tmp]")
+    .replace(/(session|cookie|authorization|token|secret|password)=?\S*/gi, "$1=[redacted]")
+    .replace(/[\r\n\t]/g, " ")
+    .slice(0, 300);
+  console.error(`${context}: ${name}${code ? ` ${code}` : ""}: ${redacted}`);
 }
 
 async function requireResourceEditor(req, res, next) {
@@ -750,8 +798,15 @@ async function runIsolated(message, timeoutMs = PROCESS_TIMEOUT_MS) {
         },
         execArgv: ["--max-old-space-size=192"],
         stdio: ["ignore", "ignore", "ignore", "ipc"],
+        detached: process.platform !== "win32",
         windowsHide: true
       });
+      const terminate = () => {
+        try {
+          if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+          else child.kill("SIGKILL");
+        } catch {}
+      };
       let settled = false;
       const finish = (error, result) => {
         if (settled) return;
@@ -761,7 +816,7 @@ async function runIsolated(message, timeoutMs = PROCESS_TIMEOUT_MS) {
         else resolve(result);
       };
       const timer = setTimeout(() => {
-        child.kill("SIGKILL");
+        terminate();
         finish(new Error("Processing timed out."));
       }, timeoutMs);
       child.once("error", (error) => finish(error));
@@ -949,7 +1004,62 @@ app.get("/login", allowPublic, (req, res) => {
 });
 
 app.get("/health", allowPublic, (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, status: "live" });
+});
+
+function executablePath(command) {
+  if (path.isAbsolute(command)) return command;
+  for (const directory of String(process.env.PATH || "").split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+async function probeWritable(directory) {
+  const probe = path.join(directory, `.health-${process.pid}-${crypto.randomUUID()}`);
+  const handle = await fsp.open(probe, "wx", 0o600);
+  try {
+    await handle.writeFile("");
+    await handle.sync();
+  } finally {
+    await handle.close();
+    await fsp.unlink(probe).catch(() => undefined);
+  }
+}
+
+app.get("/ready", allowPublic, async (_req, res) => {
+  const checks = {};
+  try {
+    checks.sqlite = database && database.prepare("SELECT 1 AS ok").get().ok === 1;
+  } catch {
+    checks.sqlite = false;
+  }
+  const writable = {
+    database: path.dirname(DATABASE_FILE),
+    uploads: UPLOADS_DIR,
+    thumbnails: THUMB_DIR,
+    staging: STAGING_DIR,
+    quarantine: TRASH_DIR
+  };
+  for (const [name, directory] of Object.entries(writable)) {
+    try {
+      await probeWritable(directory);
+      checks[name] = true;
+    } catch {
+      checks[name] = false;
+    }
+  }
+  checks.pdfinfo = Boolean(executablePath(PDFINFO_BIN));
+  checks.pdftoppm = Boolean(executablePath(PDFTOPPM_BIN));
+  checks.worker = fs.existsSync(path.join(ROOT, "processing-worker.js"));
+  checks.integrity = Boolean(startupIntegrityReport && startupIntegrityReport.ok);
+  const ok = Object.values(checks).every(Boolean);
+  res.status(ok ? 200 : 503).json({ ok, status: ok ? "ready" : "unready", checks });
 });
 
 app.get("/api/auth/me", requireAuthenticated, (req, res) => {
@@ -1069,7 +1179,7 @@ app.patch("/api/resources/:id", requireAuthenticated, requireSameOrigin, require
       operationType: "cleanup", actorId: req.adminSession.userId,
       resourceId: req.params.id, error, details: { operation: "metadata_update" }
     });
-    console.error(error);
+    safeLogError("resource update failed", error);
     return res.status(500).json({ error: "Update failed." });
   }
 });
@@ -1127,7 +1237,7 @@ app.post(
       return res.json({ resource: fullResource(updated) });
     } catch (error) {
       await removeTempFiles([file]);
-      console.error(error);
+      safeLogError("resource replacement failed", error);
       if (error instanceof UploadPolicyError) {
         return res.status(error.status).json({ error: error.message });
       }
@@ -1161,7 +1271,7 @@ app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, a
     resourceStore.finalizeDeletion(pending.operationId, req.adminSession.userId);
     return res.json({ ok: true });
   } catch (error) {
-    console.error(error);
+    safeLogError("resource deletion failed", error);
     return res.status(500).json({
       error: "Deletion is incomplete. An administrator must run the integrity report and retry cleanup."
     });
@@ -1185,7 +1295,7 @@ app.post("/api/resources/:id/annotations", requireAuthenticated, requireSameOrig
     if (!annotation) return res.status(404).json({ error: "Sheet not found." });
     return res.status(201).json({ annotation });
   } catch (error) {
-    console.error(error);
+    safeLogError("annotation creation failed", error);
     return res.status(500).json({ error: "Could not save annotation." });
   }
 });
@@ -1201,7 +1311,7 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAuthenticated,
     if (result.status === "forbidden") return res.status(403).json({ error: "You cannot modify this annotation." });
     return res.json({ ok: true });
   } catch (error) {
-    console.error(error);
+    safeLogError("annotation deletion failed", error);
     return res.status(500).json({ error: "Could not delete annotation." });
   }
 });
@@ -1292,7 +1402,7 @@ app.post(
     res.status(201).json({ resources: created.map(publicResource) });
   } catch (error) {
     await removeTempFiles(files);
-    console.error(error);
+    safeLogError("upload failed", error);
     if (error instanceof UploadPolicyError) {
       return res.status(error.status).json({ error: error.message });
     }
@@ -1317,7 +1427,7 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
 
     res.json({ ok: true, refreshed });
   } catch (error) {
-    console.error(error);
+    safeLogError("thumbnail refresh failed", error);
     res.status(500).json({ error: "Could not refresh thumbnails." });
   }
 });
@@ -1383,7 +1493,7 @@ app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
     return res.type("png").sendFile(thumbnailPath);
   } catch (error) {
-    console.error("Thumbnail generation failed:", error);
+    safeLogError("thumbnail delivery failed", error);
     res.status(500).send("Thumbnail generation failed.");
   }
 });
@@ -1427,7 +1537,7 @@ app.use((error, _req, res, next) => {
     return res.status(400).json({ error: "The upload could not be processed." });
   }
 
-  console.error(error);
+  safeLogError("request failed", error);
   res.status(500).json({ error: "Something went wrong." });
 });
 
@@ -4182,6 +4292,6 @@ ensureStorage()
     server.headersTimeout = Math.min(60000, REQUEST_TIMEOUT_MS);
   })
   .catch((error) => {
-    console.error('Failed to prepare storage:', error);
+    safeLogError("storage startup failed", error);
     process.exit(1);
   });

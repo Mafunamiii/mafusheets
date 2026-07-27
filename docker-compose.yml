@@ -1,17 +1,65 @@
 services:
+  storage-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mafusheets:${IMAGE_TAG:-production}
+    user: "0:0"
+    read_only: true
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        chown -R 1000:1000
+        /var/lib/mafusheets/database
+        /var/lib/mafusheets/uploads
+        /var/lib/mafusheets/thumbnails
+        /var/lib/mafusheets/staging
+        /var/lib/mafusheets/quarantine
+        &&
+        chmod -R u=rwX,go=
+        /var/lib/mafusheets/database
+        /var/lib/mafusheets/uploads
+        /var/lib/mafusheets/thumbnails
+        /var/lib/mafusheets/staging
+        /var/lib/mafusheets/quarantine
+        &&
+        find /var/lib/mafusheets/database -type f -name '*backup*'
+        -exec chmod 0400 '{}' ';'
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt:
+      - no-new-privileges:true
+    volumes: &storage-volumes
+      - database:/var/lib/mafusheets/database
+      - uploads:/var/lib/mafusheets/uploads
+      - thumbnails:/var/lib/mafusheets/thumbnails
+      - staging:/var/lib/mafusheets/staging
+      - quarantine:/var/lib/mafusheets/quarantine
+    restart: "no"
+
   mafusheets:
-    build: .
-    container_name: mafusheets
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+    image: mafusheets:${IMAGE_TAG:-production}
+    user: "1000:1000"
+    init: true
+    read_only: true
     environment:
-      HOST: ${HOST:-0.0.0.0}
-      PORT: ${PORT:-3000}
-      PDFTOPPM_BIN: ${PDFTOPPM_BIN:-pdftoppm}
-      PDFINFO_BIN: ${PDFINFO_BIN:-pdfinfo}
-      DATABASE_PATH: ${DATABASE_PATH:-/app/data/mafusheets.sqlite}
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the public https URL}
+      REQUIRE_HTTPS: "1"
+      TRUST_PROXY: 172.30.0.20
+      PDFTOPPM_BIN: /usr/bin/pdftoppm
+      PDFINFO_BIN: /usr/bin/pdfinfo
+      DATABASE_PATH: /var/lib/mafusheets/database/mafusheets.sqlite
+      DATA_DIR: /var/lib/mafusheets/database
+      UPLOADS_DIR: /var/lib/mafusheets/uploads
+      THUMB_DIR: /var/lib/mafusheets/thumbnails
+      TMP_DIR: /var/lib/mafusheets/staging
+      QUARANTINE_DIR: /var/lib/mafusheets/quarantine
       SESSION_SECRET: ${SESSION_SECRET:?Set a strong persistent SESSION_SECRET}
-      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      COOKIE_SECURE: "1"
       UPLOAD_MAX_FILE_BYTES: ${UPLOAD_MAX_FILE_BYTES:-52428800}
       UPLOAD_MAX_REQUEST_BYTES: ${UPLOAD_MAX_REQUEST_BYTES:-157286400}
       UPLOAD_MAX_FILES: ${UPLOAD_MAX_FILES:-10}
@@ -24,8 +72,78 @@ services:
       UPLOAD_MAX_PDF_PAGES: ${UPLOAD_MAX_PDF_PAGES:-500}
       UPLOAD_MAX_IMAGE_PIXELS: ${UPLOAD_MAX_IMAGE_PIXELS:-40000000}
       UPLOAD_STAGING_MAX_AGE_MS: ${UPLOAD_STAGING_MAX_AGE_MS:-86400000}
-    volumes:
-      - ./data:/app/data
-      - ./uploads:/app/uploads
-      - ./.tmp:/app/.tmp
+    volumes: *storage-volumes
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700
+    expose:
+      - "3000"
+    networks:
+      proxy:
+        ipv4_address: 172.30.0.10
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 768m
+    mem_reservation: 256m
+    cpus: 1.5
     restart: unless-stopped
+
+  nginx:
+    build:
+      context: nginx
+      dockerfile: Dockerfile
+    image: mafusheets-nginx:${IMAGE_TAG:-production}
+    user: "101:101"
+    read_only: true
+    ports:
+      - "${HTTPS_BIND_IP:-0.0.0.0}:${HTTP_PORT:-80}:8080"
+      - "${HTTPS_BIND_IP:-0.0.0.0}:${HTTPS_PORT:-443}:8443"
+    volumes:
+      - ${TLS_CERT_PATH:?Set TLS_CERT_PATH}:/etc/nginx/tls/tls.crt:ro
+      - ${TLS_KEY_PATH:?Set TLS_KEY_PATH}:/etc/nginx/tls/tls.key:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,uid=101,gid=101,mode=0700
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=16m,uid=101,gid=101,mode=0700
+    networks:
+      proxy:
+        ipv4_address: 172.30.0.20
+    depends_on:
+      mafusheets:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-q", "-O", "/dev/null", "https://127.0.0.1:8443/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
+    restart: unless-stopped
+
+networks:
+  proxy:
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  database:
+  uploads:
+  thumbnails:
+  staging:
+  quarantine:
