@@ -5,12 +5,12 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
-const { fork } = require("child_process");
 const { normalizeSearchText } = require("./search-indexer");
 const { createCatalogStore, migrateLegacyCatalog, openDatabase } = require("./lib/database");
 const { createUserStore } = require("./lib/users");
 const { createResourceStore } = require("./lib/resources");
 const { createProcessingJobStore } = require("./lib/processing-jobs");
+const { runWorkerProcess } = require("./lib/isolated-worker");
 const {
   UploadPolicyError,
   normalizeFilename,
@@ -96,7 +96,10 @@ if (
   throw new Error("PUBLIC_ORIGIN must be an https:// origin without a path when REQUIRE_HTTPS=1.");
 }
 
-function boundedInteger(name, defaultValue, { min, max, allowDisabled = false } = {}) {
+function boundedInteger(
+  name, defaultValue,
+  { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER, allowDisabled = false } = {}
+) {
   const raw = process.env[name];
   if (allowDisabled && raw === "disabled") return null;
   const value = raw === undefined || raw === "" ? defaultValue : Number(raw);
@@ -187,14 +190,6 @@ const uploadKinds = {
     extensions: new Set([".txt", ".md", ".docx"]),
     storageCategory: "documents"
   }
-};
-
-const sheetKinds = {
-  all: { label: "All" },
-  pdf: { label: "PDFs" },
-  image: { label: "Images" },
-  chart: { label: "Charts" },
-  other: { label: "Other" }
 };
 
 const mimeTypes = {
@@ -671,7 +666,10 @@ function annotationsCount(resource) {
 }
 
 function publicResource(resource) {
-  const { searchText, storedName, annotations, ...safeResource } = resource;
+  const safeResource = { ...resource };
+  delete safeResource.searchText;
+  delete safeResource.storedName;
+  delete safeResource.annotations;
   const sheetKind = resource.sheetKind || sheetKindForExtension(resource.extension);
   return {
     ...safeResource,
@@ -789,45 +787,13 @@ function workerLimits() {
 async function runIsolated(message, timeoutMs = PROCESS_TIMEOUT_MS) {
   await acquireValidationSlot();
   try {
-    return await new Promise((resolve, reject) => {
-      const child = fork(path.join(ROOT, "processing-worker.js"), [], {
-        cwd: TMP_DIR,
-        env: {
-          NODE_ENV: "production",
-          PATH: process.env.PATH || ""
-        },
-        execArgv: ["--max-old-space-size=192"],
-        stdio: ["ignore", "ignore", "ignore", "ipc"],
-        detached: process.platform !== "win32",
-        windowsHide: true
-      });
-      const terminate = () => {
-        try {
-          if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
-          else child.kill("SIGKILL");
-        } catch {}
-      };
-      let settled = false;
-      const finish = (error, result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) reject(error);
-        else resolve(result);
-      };
-      const timer = setTimeout(() => {
-        terminate();
-        finish(new Error("Processing timed out."));
-      }, timeoutMs);
-      child.once("error", (error) => finish(error));
-      child.once("exit", (code, signal) => {
-        if (!settled) finish(new Error(`Worker stopped unexpectedly (${signal || code}).`));
-      });
-      child.once("message", (response) => {
-        if (response && response.ok) finish(null, response.result);
-        else finish(new Error(response && response.error || "Worker rejected the file."));
-      });
-      child.send({ ...message, limits: workerLimits() });
+    return await runWorkerProcess({
+      workerPath: path.join(ROOT, "processing-worker.js"),
+      cwd: TMP_DIR,
+      message,
+      limits: workerLimits(),
+      timeoutMs,
+      envPath: process.env.PATH || ""
     });
   } finally {
     releaseValidationSlot();
@@ -936,16 +902,25 @@ async function executeProcessingJob(job) {
       filePath,
       thumbnailPath: temporaryThumbnail
     }, PROCESS_TIMEOUT_MS);
-    resourceStore.updateSearchIndex(
+    const committed = resourceStore.updateSearchIndex(
       resource.id, resource.updatedAt,
       { searchText: result.searchText, searchStatus: result.searchStatus },
       job.actor_user_id
     );
+    if (!committed) {
+      const conflict = Object.assign(
+        new Error("Resource changed while processing; retrying current version."),
+        { code: "PROCESSING_VERSION_CONFLICT" }
+      );
+      throw conflict;
+    }
     if (result.generatedThumbnail) {
       await fsp.rename(result.generatedThumbnail, thumbnailPath);
       resourceStore.finishPendingThumbnails(resource.id);
     }
   } catch (error) {
+    error.processingResourceId = resource.id;
+    error.processingExpectedUpdatedAt = resource.updatedAt;
     throw error;
   } finally {
     await Promise.all([
@@ -967,7 +942,21 @@ function scheduleProcessing() {
       processingActive += 1;
       executeProcessingJob(job)
         .then(() => processingJobStore.succeed(job.id))
-        .catch((error) => processingJobStore.fail(job.id, error))
+        .catch((error) => {
+          const outcome = processingJobStore.fail(job.id, error);
+          if (
+            outcome === "failed" && error.processingResourceId &&
+            error.processingExpectedUpdatedAt
+          ) {
+            resourceStore.markProcessingFailed(
+              error.processingResourceId,
+              error.processingExpectedUpdatedAt,
+              job.actor_user_id,
+              error.code === "PROCESSING_VERSION_CONFLICT"
+                ? "version conflict retry limit reached" : "processing retry limit reached"
+            );
+          }
+        })
         .finally(() => {
           processingActive -= 1;
           scheduleProcessing();
@@ -992,7 +981,8 @@ app.get("/", allowPublic, (req, res) => {
     csrfToken: session.csrfToken,
     username: session.user,
     userId: session.userId,
-    role: session.role
+    role: session.role,
+    mustChangePassword: session.mustChangePassword
   }));
 });
 
@@ -1140,7 +1130,9 @@ app.get("/api/resources", requireAuthenticated, async (req, res) => {
     return inKind && resourceMatchesQuery(resource, query);
   });
 
-  filtered.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+  filtered.sort((a, b) =>
+    new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+  );
 
   res.json({
     total: resources.length,
@@ -1467,7 +1459,8 @@ app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
       csrfToken: session ? session.csrfToken : "",
       username: session ? session.user : "",
       userId: session ? session.userId : "",
-      role: session ? session.role : ""
+      role: session ? session.role : "",
+      mustChangePassword: session ? session.mustChangePassword : false
     }));
   }
 
@@ -1478,7 +1471,8 @@ app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
   res.type("html").send(renderReaderHtml(resource.id, {
     authenticated: Boolean(session),
     csrfToken: session ? session.csrfToken : "",
-    username: session ? session.user : ""
+    username: session ? session.user : "",
+    role: session ? session.role : ""
   }));
 });
 
@@ -1558,11 +1552,15 @@ app.use((req, res) => {
     csrfToken: session.csrfToken,
     username: session.user,
     userId: session.userId,
-    role: session.role
+    role: session.role,
+    mustChangePassword: session.mustChangePassword
   }));
 });
 
-function renderReaderHtml(resourceId, { authenticated = false, csrfToken = "", username = "" } = {}) {
+function renderReaderHtml(
+  resourceId,
+  { authenticated = false, csrfToken = "", username = "", role = "" } = {}
+) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -2458,7 +2456,8 @@ function renderLoginHtml() {
 }
 
 function renderMainHtml({
-  authenticated = false, csrfToken = "", username = "", userId = "", role = ""
+  authenticated = false, csrfToken = "", username = "", userId = "", role = "",
+  mustChangePassword = false
 } = {}) {
   return `<!doctype html>
 <html lang="en">
@@ -3569,6 +3568,28 @@ function renderMainHtml({
     </div>
   </dialog>
 
+  <dialog class="actions-dialog" id="passwordChangeDialog"
+    aria-labelledby="passwordChangeTitle" aria-describedby="passwordChangeHelp">
+    <aside class="panel upload-panel">
+      <h2 id="passwordChangeTitle">Change temporary password</h2>
+      <p id="passwordChangeHelp">You must choose a new password before using the library.</p>
+      <form id="passwordChangeForm">
+        <label>Current password
+          <input id="currentPasswordInput" type="password" autocomplete="current-password" required>
+        </label>
+        <label>New password
+          <input id="newPasswordInput" type="password" autocomplete="new-password" required>
+        </label>
+        <label>Confirm new password
+          <input id="confirmPasswordInput" type="password" autocomplete="new-password" required>
+        </label>
+        <div class="message" id="passwordChangeMessage" role="alert" aria-live="assertive"></div>
+        <button class="primary" id="passwordChangeButton" type="submit">Change password</button>
+        <button class="secondary" id="passwordChangeLogout" type="button">Sign out</button>
+      </form>
+    </aside>
+  </dialog>
+
   <button class="metro-fab" id="metroFab" type="button" aria-controls="metroPanel" aria-expanded="false">Metronome</button>
 
   <aside class="metro" id="metroPanel" aria-label="Visual metronome">
@@ -3605,7 +3626,8 @@ function renderMainHtml({
       csrfToken,
       username: username || "",
       userId: userId || "",
-      role: role || ""
+      role: role || "",
+      mustChangePassword: Boolean(mustChangePassword)
     })};
 
     const kindLabels = {
@@ -3622,6 +3644,14 @@ function renderMainHtml({
     };
 
     const uploadForm = document.querySelector("#uploadForm");
+    const passwordChangeDialog = document.querySelector("#passwordChangeDialog");
+    const passwordChangeForm = document.querySelector("#passwordChangeForm");
+    const currentPasswordInput = document.querySelector("#currentPasswordInput");
+    const newPasswordInput = document.querySelector("#newPasswordInput");
+    const confirmPasswordInput = document.querySelector("#confirmPasswordInput");
+    const passwordChangeMessage = document.querySelector("#passwordChangeMessage");
+    const passwordChangeButton = document.querySelector("#passwordChangeButton");
+    const passwordChangeLogout = document.querySelector("#passwordChangeLogout");
     const actionsDialog = document.querySelector("#actionsDialog");
     const addSheetButton = document.querySelector("#addSheetButton");
     const accountButton = document.querySelector("#accountButton");
@@ -3755,6 +3785,7 @@ function renderMainHtml({
         ? String(nextState.user || nextState.username) : "";
       authState.userId = nextState && nextState.userId ? String(nextState.userId) : "";
       authState.role = nextState && nextState.role ? String(nextState.role) : "";
+      authState.mustChangePassword = Boolean(nextState && nextState.mustChangePassword);
       document.body.dataset.authenticated = authState.authenticated ? "1" : "0";
       document.body.dataset.role = authState.role;
       authBadge.textContent = authState.authenticated
@@ -3771,6 +3802,14 @@ function renderMainHtml({
         loginMessage.textContent = "";
         adminMessage.textContent = "";
       }
+    }
+
+    function requirePasswordChange() {
+      if (!authState.authenticated || !authState.mustChangePassword) return;
+      if (actionsDialog.open) actionsDialog.close();
+      if (sheetDialog.open) sheetDialog.close();
+      if (!passwordChangeDialog.open) passwordChangeDialog.showModal();
+      window.setTimeout(function() { currentPasswordInput.focus(); }, 0);
     }
 
     function currentSideTab() {
@@ -3804,6 +3843,8 @@ function renderMainHtml({
         if (!actionsDialog.open) actionsDialog.showModal();
         loginMessage.textContent = "Your session expired. Sign in to continue; unsaved form values were kept.";
         loginMessage.className = "message error";
+        passwordChangeForm.reset();
+        if (passwordChangeDialog.open) passwordChangeDialog.close();
       }
       return response;
     }
@@ -4162,8 +4203,13 @@ function renderMainHtml({
           csrfToken: result.csrfToken,
           user: result.user,
           userId: result.userId,
-          role: result.role
+          role: result.role,
+          mustChangePassword: result.mustChangePassword
         });
+        if (result.mustChangePassword) {
+          requirePasswordChange();
+          return;
+        }
         loginMessage.textContent = "Signed in.";
         loginMessage.className = "message ok";
         setSideTab("add");
@@ -4196,12 +4242,50 @@ function renderMainHtml({
           csrfToken: "",
           user: ""
         });
+        passwordChangeForm.reset();
+        if (passwordChangeDialog.open) passwordChangeDialog.close();
         adminMessage.textContent = "Signed out.";
         adminMessage.className = "message ok";
         setSideTab("admin");
       } catch (error) {
         adminMessage.textContent = error.message;
         adminMessage.className = "message error";
+      }
+    }
+
+    async function changeRequiredPassword(event) {
+      event.preventDefault();
+      passwordChangeMessage.className = "message";
+      if (newPasswordInput.value !== confirmPasswordInput.value) {
+        passwordChangeMessage.textContent = "New password confirmation does not match.";
+        passwordChangeMessage.className = "message error";
+        return;
+      }
+      passwordChangeButton.disabled = true;
+      try {
+        const response = await apiFetch("/api/auth/change-password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            currentPassword: currentPasswordInput.value,
+            newPassword: newPasswordInput.value
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          throw new Error(result.error || (response.status === 401
+            ? "Your session expired. Sign in again." : "Password validation failed."));
+        }
+        authState.csrfToken = result.csrfToken;
+        authState.mustChangePassword = false;
+        passwordChangeForm.reset();
+        passwordChangeDialog.close();
+        await loadResources();
+      } catch (error) {
+        passwordChangeMessage.textContent = error.message;
+        passwordChangeMessage.className = "message error";
+      } finally {
+        passwordChangeButton.disabled = false;
       }
     }
 
@@ -4415,6 +4499,21 @@ function renderMainHtml({
         adminMessage.className = "message error";
       });
     });
+    passwordChangeForm.addEventListener("submit", function(event) {
+      changeRequiredPassword(event).catch(function(error) {
+        passwordChangeMessage.textContent = error.message;
+        passwordChangeMessage.className = "message error";
+      });
+    });
+    passwordChangeLogout.addEventListener("click", function() {
+      logout().catch(function(error) {
+        passwordChangeMessage.textContent = error.message;
+        passwordChangeMessage.className = "message error";
+      });
+    });
+    passwordChangeDialog.addEventListener("cancel", function(event) {
+      if (authState.mustChangePassword) event.preventDefault();
+    });
 
     closeDialog.addEventListener('click', function() {
       sheetDialog.close();
@@ -4561,6 +4660,7 @@ function renderMainHtml({
     updateFileAccept();
     setViewMode(initialParams.get("view") || localStorage.getItem("mafusheets.viewMode") || "grid");
     initMetro();
+    requirePasswordChange();
     loadResources().then(function() {
       const savedScroll = Number(sessionStorage.getItem("mafusheets.scrollY") || "0");
       if (savedScroll > 0) window.scrollTo(0, savedScroll);

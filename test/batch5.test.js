@@ -7,7 +7,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { openDatabase } = require("../lib/database");
+const { EMERGENCY_ACTOR_ID, openDatabase } = require("../lib/database");
 const { createUserStore } = require("../lib/users");
 
 const ROOT = path.join(__dirname, "..");
@@ -18,7 +18,9 @@ async function unusedPort() {
     const socket = net.createServer();
     socket.once("error", reject);
     socket.listen(0, "127.0.0.1", () => {
-      const { port } = socket.address();
+      const address = socket.address();
+      if (!address || typeof address === "string") return reject(new Error("No TCP address."));
+      const { port } = address;
       socket.close(() => resolve(port));
     });
   });
@@ -32,7 +34,8 @@ async function startProductionServer(t) {
     loginIdentifier: "secure@example.test",
     displayName: "Secure User",
     password: "SecurePassword2026",
-    role: "admin"
+    role: "admin",
+    operator: { actorUserId: EMERGENCY_ACTOR_ID, mode: "emergency-system" }
   });
   db.close();
   const port = await unusedPort();

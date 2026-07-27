@@ -2,7 +2,6 @@
 
 const { execFile } = require("child_process");
 const fsp = require("fs/promises");
-const path = require("path");
 const { promisify } = require("util");
 const JSZip = require("jszip");
 const sharp = require("sharp");
@@ -98,10 +97,12 @@ async function processResource(message) {
 }
 
 process.once("message", async (message) => {
+  /** @type {any} */
+  const request = message;
   try {
-    const result = message.action === "validate"
-      ? await validate(message)
-      : await processResource(message);
+    const result = request.action === "validate"
+      ? await validate(request)
+      : await processResource(request);
     send({ ok: true, result });
     process.exit(0);
   } catch (error) {

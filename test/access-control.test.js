@@ -8,12 +8,14 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  EMERGENCY_ACTOR_ID,
   createCatalogStore,
   migrateLegacyCatalog,
   openDatabase
 } = require("../lib/database");
 const { requireSessionSecret } = require("../lib/security");
 const { createUserStore } = require("../lib/users");
+const EMERGENCY_OPERATOR = { actorUserId: EMERGENCY_ACTOR_ID, mode: "emergency-system" };
 
 const STRONG_SECRET = "v7Z!4mQp2#Lx9@Ks6^Nd3&Wc8*Hy5$Rt1+Ba";
 
@@ -22,7 +24,9 @@ async function unusedPort() {
     const socket = net.createServer();
     socket.once("error", reject);
     socket.listen(0, "127.0.0.1", () => {
-      const { port } = socket.address();
+      const address = socket.address();
+      if (!address || typeof address === "string") return reject(new Error("No TCP address."));
+      const { port } = address;
       socket.close(() => resolve(port));
     });
   });
@@ -44,7 +48,9 @@ async function login(base, username, password, cookie = "") {
   return { response, body: await response.json(), cookie: cookieFrom(response) };
 }
 
-async function api(base, route, { method = "GET", cookie = "", csrf = "", body } = {}) {
+/** @param {{method?: string, cookie?: string, csrf?: string, body?: any}} [options] */
+async function api(base, route, options = {}) {
+  const { method = "GET", cookie = "", csrf = "", body } = options;
   const response = await fetch(`${base}${route}`, {
     method,
     headers: {
@@ -99,22 +105,27 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
     loginIdentifier: "admin@example.test",
     displayName: "Admin",
     password: "AdminPassword2026",
-    role: "admin"
+    role: "admin",
+    operator: EMERGENCY_OPERATOR
   });
   const member = await users.createUser({
     loginIdentifier: "member@example.test",
     displayName: "Member",
     password: "MemberPassword2026",
-    role: "member"
+    role: "member",
+    operator: { actorUserId: admin.id, mode: "administrator" }
   });
   const other = await users.createUser({
     loginIdentifier: "other@example.test",
     displayName: "Other",
     password: "OtherPassword2026",
-    role: "member"
+    role: "member",
+    operator: { actorUserId: admin.id, mode: "administrator" }
   });
-  assert.throws(() => users.setEnabled(admin.id, false), /last enabled administrator/);
-  assert.throws(() => users.setRole(admin.id, "member"), /last enabled administrator/);
+  assert.throws(() => users.setEnabled(admin.id, false, { actorUserId: admin.id }),
+    /last enabled administrator/);
+  assert.throws(() => users.setRole(admin.id, "member", { actorUserId: admin.id }),
+    /last enabled administrator/);
   createCatalogStore(db).replaceResources([
     {
       id: "member-resource",
@@ -240,7 +251,7 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
   }
 
   const liveDb = openDatabase(databasePath);
-  createUserStore(liveDb).setEnabled(member.id, false);
+  createUserStore(liveDb).setEnabled(member.id, false, { actorUserId: admin.id });
   assert.equal((await api(base, "/api/resources", memberAuth)).response.status, 401);
   liveDb.close();
 

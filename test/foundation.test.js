@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  EMERGENCY_ACTOR_ID,
   LEGACY_IMPORT_KEY,
   MIGRATION_ACTOR_ID,
   createCatalogStore,
@@ -15,6 +16,7 @@ const {
 } = require("../lib/database");
 const { hashPassword, verifyPassword } = require("../lib/passwords");
 const { createUserStore } = require("../lib/users");
+const EMERGENCY_OPERATOR = { actorUserId: EMERGENCY_ACTOR_ID, mode: "emergency-system" };
 
 async function fixture(t) {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "mafusheets-test-"));
@@ -50,7 +52,7 @@ test("clean database initialization enables schema and foreign keys", async (t) 
   const result = await migrateLegacyCatalog(db, catalogPath);
   assert.equal(result.status, "initialized-empty");
   assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 4);
+  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 5);
   assert.equal(createCatalogStore(db).listResources().length, 0);
 });
 
@@ -117,18 +119,20 @@ test("users retain roles and disabled users cannot authenticate", async (t) => {
     loginIdentifier: "director@example.test",
     displayName: "Choir Director",
     password: "DirectorAccount2026",
-    role: "admin"
+    role: "admin",
+    operator: EMERGENCY_OPERATOR
   });
   const member = await users.createUser({
     loginIdentifier: "member@example.test",
     displayName: "Choir Member",
     password: "MemberAccount2026",
-    role: "member"
+    role: "member",
+    operator: { actorUserId: admin.id, mode: "administrator" }
   });
   assert.equal(admin.role, "admin");
   assert.equal(member.role, "member");
   assert.equal(await users.authenticate("member@example.test", "MemberAccount2026").then(Boolean), true);
-  users.setEnabled(member.id, false);
+  users.setEnabled(member.id, false, { actorUserId: admin.id, mode: "administrator" });
   assert.equal(await users.authenticate("member@example.test", "MemberAccount2026"), null);
   const stored = db.prepare("SELECT password_hash FROM users WHERE id=?").get(admin.id);
   assert.notEqual(stored.password_hash, "DirectorAccount2026");
@@ -163,7 +167,7 @@ test("migration transaction rolls back every inserted row on failure", async (t)
     /injected failure/
   );
   assert.equal(db.prepare("SELECT COUNT(*) count FROM resources").get().count, 0);
-  assert.equal(db.prepare("SELECT COUNT(*) count FROM users").get().count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM users WHERE is_system=0").get().count, 0);
   assert.equal(db.prepare("SELECT COUNT(*) count FROM audit_events").get().count, 0);
   assert.equal(db.prepare("SELECT value FROM app_metadata WHERE key=?").get(LEGACY_IMPORT_KEY), undefined);
   assert.equal((await migrateLegacyCatalog(db, catalogPath)).status, "migrated");

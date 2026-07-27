@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "node16",
+    "types": ["node"]
+  },
+  "include": [
+    "*.js",
+    "lib/**/*.js",
+    "scripts/**/*.js",
+    "test/**/*.js",
+    "types.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "data",
+    "uploads",
+    "thumbnails",
+    "backups",
+    "playwright-report",
+    "test-results"
+  ]
+}

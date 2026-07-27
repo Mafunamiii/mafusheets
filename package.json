@@ -8,7 +8,22 @@
     "reindex": "node reindex.js",
     "integrity": "node lib/integrity.js",
     "account": "node lib/bootstrap.js",
-    "test": "node --test"
+    "backup": "node scripts/release-data.js backup",
+    "restore": "node scripts/release-data.js restore",
+    "rollback": "node scripts/release-data.js rollback",
+    "test": "node --test test/*.test.js",
+    "test:batch8a": "node --test test/batch8a.test.js",
+    "test:failure": "node --test --test-name-pattern='SQLite lock|ENOSPC|forced worker timeout|restart reports|concurrent resource|missing thumbnail binary' test/batch8a.test.js",
+    "rehearse:backup": "node --test --test-name-pattern='paired backup' test/batch8a.test.js",
+    "test:browser": "playwright test",
+    "test:browser:desktop": "playwright test --project=chromium-desktop",
+    "test:browser:mobile": "playwright test --project=chromium-mobile",
+    "lint": "eslint .",
+    "lint:source": "eslint server.js processing-worker.js search-indexer.js reindex.js lib",
+    "lint:test": "eslint test playwright.config.js",
+    "lint:scripts": "eslint scripts",
+    "static-check": "tsc -p tsconfig.json",
+    "validate": "npm test && npm run lint && npm run static-check"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
@@ -23,5 +38,13 @@
   },
   "engines": {
     "node": ">=20.9"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.62.0",
+    "@types/node": "^26.1.1",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0",
+    "typescript": "^7.0.2"
   }
 }

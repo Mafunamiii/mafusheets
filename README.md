@@ -30,7 +30,8 @@ Supply the initial account password only for the account command:
 
 ```bash
 MAFUSHEETS_NEW_PASSWORD='choose-a-strong-unique-password' \
-  npm run account -- create-user --login director --display-name "Choir Director" --role admin
+  npm run account -- create-user --login director --display-name "Choir Director" \
+    --role admin --emergency-system-actor
 ```
 
 There is no default account or password and no public registration route. Account commands also support
@@ -39,6 +40,18 @@ There is no default account or password and no public registration route. Accoun
 passwords through `MAFUSHEETS_NEW_PASSWORD`. Password resets revoke active sessions and require
 the user to change the temporary password unless `--no-required-change` is explicitly supplied.
 The final enabled administrator cannot be disabled or demoted.
+
+Every account-changing command requires exactly one attribution mode. Normally use
+`--operator LOGIN_OR_ID`, which must resolve to an enabled administrator:
+
+```bash
+npm run account -- disable-user --id AFFECTED_USER_ID --operator director
+```
+
+`--emergency-system-actor` is reserved for the first administrator or documented local recovery.
+It records the stable, disabled, non-login emergency actor and a conspicuous emergency mode in the
+audit event. The affected account remains the event entity. Never place passwords on the command
+line; use `MAFUSHEETS_NEW_PASSWORD`.
 
 ## Run with Docker Compose locally
 
@@ -235,6 +248,67 @@ The app stores files in:
 - `data/mafusheets.sqlite`
 
 Back up `uploads/` and the SQLite database together.
+
+### Paired backup, restore, and rollback
+
+Stop or quiesce application writes before taking a paired backup. The command refuses to proceed
+without the explicit `--quiesced` acknowledgement:
+
+```bash
+npm run backup -- --quiesced \
+  --database /isolated/data/mafusheets.sqlite \
+  --uploads /isolated/uploads \
+  --output /isolated/backups/2026-07-27 \
+  --release 8A --image mafusheets:8A --config-id choir-production-v1
+```
+
+The backup directory contains an SQLite backup-API snapshot, the uploads tree, and a manifest with
+schema/release identifiers, modes, ownership metadata, sizes, and SHA-256 checksums. It includes
+only explicitly selected data, so session secrets, TLS keys, staging, worker output, and unrelated
+runtime artifacts are excluded.
+
+Restore defaults to a nonexistent database and an empty or nonexistent uploads directory. It
+verifies every checksum and path before writing, then runs SQLite integrity and resource/file
+reconciliation:
+
+```bash
+npm run restore -- \
+  --source /isolated/backups/2026-07-27 \
+  --database /isolated/restore/mafusheets.sqlite \
+  --uploads /isolated/restore/uploads
+```
+
+Create a rollback plan from previously recorded non-secret release metadata:
+
+```bash
+npm run rollback -- \
+  --previous /isolated/releases/previous.json \
+  --current /isolated/releases/failed.json \
+  --output /isolated/releases/rollback-plan.json
+```
+
+All commands emit a one-line JSON result on stdout and a human summary on stderr. They refuse
+symlinks, traversal, roots, ambiguous destinations, and existing restore databases.
+
+### Release validation
+
+```bash
+npm test
+npm run test:batch8a
+npm run test:failure
+npm run rehearse:backup
+npm run test:browser
+npm run lint
+npm run static-check
+npm run validate
+```
+
+Playwright provides `chromium-desktop` at 1280×800 and `chromium-mobile` at 390×844. Its server
+fixture creates a fresh temporary database and storage tree and never uses configured live data.
+Browsers are development dependencies only and are not copied into the production image.
+
+Batch 8A failure tests use temporary directories, child processes, and direct test-only module
+hooks. No fault-injection switch or ordinary HTTP request can activate them in production.
 
 Resource uploads and replacements are staged before their database commit. Deletions move required
 artifacts into `data/quarantine` before the resource is marked deleted and only report success after

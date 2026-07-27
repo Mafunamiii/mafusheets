@@ -15,6 +15,7 @@ const {
 } = require("../lib/upload-policy");
 const { createProcessingJobStore } = require("../lib/processing-jobs");
 const {
+  EMERGENCY_ACTOR_ID,
   MIGRATION_ACTOR_ID,
   migrateLegacyCatalog,
   openDatabase
@@ -28,7 +29,9 @@ async function unusedPort() {
     const socket = net.createServer();
     socket.once("error", reject);
     socket.listen(0, "127.0.0.1", () => {
-      const port = socket.address().port;
+      const address = socket.address();
+      if (!address || typeof address === "string") return reject(new Error("No TCP address."));
+      const port = address.port;
       socket.close(() => resolve(port));
     });
   });
@@ -75,7 +78,8 @@ test("declared MIME must match the extension", () => {
   assert.doesNotThrow(() => validateDeclaredMime(".pdf", "application/pdf"));
   assert.throws(
     () => validateDeclaredMime(".pdf", "image/png"),
-    (error) => error.code === "MIME_MISMATCH"
+    (error) => Boolean(error && typeof error === "object" && "code" in error &&
+      error.code === "MIME_MISMATCH")
   );
 });
 
@@ -83,12 +87,14 @@ test("actual signatures reject forged PDFs and forged images", async (t) => {
   const forgedPdf = await temporaryFile(t, Buffer.from("not a pdf"));
   await assert.rejects(
     validateSignature(forgedPdf, ".pdf", { maxImagePixels: 40_000_000 }),
-    (error) => error.code === "BAD_SIGNATURE"
+    (error) => Boolean(error && typeof error === "object" && "code" in error &&
+      error.code === "BAD_SIGNATURE")
   );
   const forgedPng = await temporaryFile(t, Buffer.from("%PDF-1.4\n%%EOF"));
   await assert.rejects(
     validateSignature(forgedPng, ".png", { maxImagePixels: 40_000_000 }),
-    (error) => error.code === "BAD_SIGNATURE"
+    (error) => Boolean(error && typeof error === "object" && "code" in error &&
+      error.code === "BAD_SIGNATURE")
   );
 });
 
@@ -101,7 +107,8 @@ test("extreme PNG dimensions are rejected before image decoding", async (t) => {
   const filePath = await temporaryFile(t, header);
   await assert.rejects(
     validateSignature(filePath, ".png", { maxImagePixels: 40_000_000 }),
-    (error) => error.code === "IMAGE_DIMENSIONS"
+    (error) => Boolean(error && typeof error === "object" && "code" in error &&
+      error.code === "IMAGE_DIMENSIONS")
   );
 });
 
@@ -143,7 +150,8 @@ test("HTTP uploads reject size, count, quota, forgery, traversal, partial batche
     loginIdentifier: "uploader@example.test",
     displayName: "Uploader",
     password: "UploaderPassword2026",
-    role: "member"
+    role: "member",
+    operator: { actorUserId: EMERGENCY_ACTOR_ID, mode: "emergency-system" }
   });
   db.close();
 
