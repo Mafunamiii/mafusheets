@@ -990,7 +990,9 @@ app.get("/", allowPublic, (req, res) => {
   res.type("html").send(renderMainHtml({
     authenticated: true,
     csrfToken: session.csrfToken,
-    username: session.user
+    username: session.user,
+    userId: session.userId,
+    role: session.role
   }));
 });
 
@@ -1067,6 +1069,7 @@ app.get("/api/auth/me", requireAuthenticated, (req, res) => {
   res.json({
     authenticated: true,
     user: session.user,
+    userId: session.userId,
     role: session.role,
     mustChangePassword: session.mustChangePassword,
     csrfToken: session.csrfToken
@@ -1098,6 +1101,7 @@ app.post("/api/auth/login", allowPublic, authLimiter, requireSameOrigin, async (
   res.json({
     ok: true,
     user: session.user,
+    userId: session.userId,
     role: session.role,
     mustChangePassword: user.mustChangePassword,
     csrfToken: session.csrfToken
@@ -1461,7 +1465,9 @@ app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
     return res.status(404).type("html").send(renderMainHtml({
       authenticated: Boolean(session),
       csrfToken: session ? session.csrfToken : "",
-      username: session ? session.user : ""
+      username: session ? session.user : "",
+      userId: session ? session.userId : "",
+      role: session ? session.role : ""
     }));
   }
 
@@ -1550,7 +1556,9 @@ app.use((req, res) => {
   return res.status(404).type("html").send(renderMainHtml({
     authenticated: true,
     csrfToken: session.csrfToken,
-    username: session.user
+    username: session.user,
+    userId: session.userId,
+    role: session.role
   }));
 });
 
@@ -1862,7 +1870,7 @@ function renderReaderHtml(resourceId, { authenticated = false, csrfToken = "", u
     }
   </style>
 </head>
-<body data-authenticated="${authenticated ? "1" : "0"}">
+<body data-authenticated="${authenticated ? "1" : "0"}" data-role="${escapeHtmlText(role)}">
   <main class="reader">
     <header class="reader-bar">
       <a class="icon-button" href="/" title="Back to library" aria-label="Back to library">&larr;</a>
@@ -2449,7 +2457,9 @@ function renderLoginHtml() {
 </html>`;
 }
 
-function renderMainHtml({ authenticated = false, csrfToken = "", username = "" } = {}) {
+function renderMainHtml({
+  authenticated = false, csrfToken = "", username = "", userId = "", role = ""
+} = {}) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -2591,10 +2601,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     .layout {
-      display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
-      gap: 18px;
-      align-items: start;
+      display: block;
     }
 
     .panel {
@@ -2605,10 +2612,27 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     .upload-panel {
-      position: sticky;
-      top: 18px;
       padding: 18px;
     }
+
+    .actions-dialog {
+      width: min(620px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 12px;
+      color: var(--text);
+      background: transparent;
+    }
+
+    .actions-dialog::backdrop {
+      background: rgba(5, 6, 9, .76);
+      backdrop-filter: blur(4px);
+    }
+
+    .actions-dialog .upload-panel { box-shadow: var(--shadow); }
+    .panel-title .close { flex: 0 0 auto; }
 
     .tab-panels {
       display: grid;
@@ -2667,6 +2691,10 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
 
     body:not([data-authenticated="1"]) .requires-auth {
       display: none;
+    }
+
+    body:not([data-role="admin"]) .admin-only {
+      display: none !important;
     }
 
     .upload-logo {
@@ -2792,6 +2820,30 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       border-bottom: 1px solid var(--line);
     }
 
+    .library-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .library-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .library-state {
+      grid-column: 1 / -1;
+      padding: 36px 18px;
+      text-align: center;
+      color: var(--muted);
+    }
+
+    .library-state.error { color: var(--danger); }
+    .library-state .action { margin-top: 14px; }
+
     .tabs {
       display: flex;
       gap: 8px;
@@ -2830,7 +2882,8 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     .resource-grid.list-view {
-      grid-template-columns: 1fr;
+      display: block;
+      padding: 8px 16px 16px;
     }
 
     .card {
@@ -2844,9 +2897,14 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     .resource-grid.list-view .card {
-      grid-template-columns: 132px minmax(0, 1fr);
-      grid-template-rows: auto;
-      align-items: stretch;
+      display: grid;
+      grid-template-columns: minmax(150px, 1.4fr) minmax(180px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      min-height: 52px;
+      padding: 7px 10px;
+      margin-top: 6px;
+      border-radius: 6px;
     }
 
     .preview {
@@ -2863,12 +2921,6 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       border: 0;
       cursor: pointer;
       appearance: none;
-    }
-
-    .resource-grid.list-view .preview {
-      border-bottom: 0;
-      border-right: 1px solid var(--line);
-      min-height: 100%;
     }
 
     .preview img {
@@ -2914,8 +2966,38 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     .resource-grid.list-view .card-body {
-      padding: 14px;
-      align-content: start;
+      display: contents;
+    }
+
+    .resource-grid.list-view .card h3 { font-size: .93rem; }
+    .resource-grid.list-view .meta {
+      display: block;
+      font-size: .78rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .resource-grid.list-view .meta span { display: inline; }
+    .resource-grid.list-view .meta span + span::before { content: " · "; }
+    .resource-grid.list-view .chips { display: none; }
+    .resource-grid.list-view .actions {
+      margin: 0;
+      flex-wrap: nowrap;
+      justify-content: end;
+    }
+    .resource-grid.list-view .action { min-height: 38px; }
+
+    .thumbnail-placeholder {
+      display: grid;
+      place-items: center;
+      width: 100%;
+      height: 100%;
+      min-height: 120px;
+      padding: 12px;
+      text-align: center;
+      color: var(--muted);
+      background: #12141a;
+      font-size: .82rem;
     }
 
     .card h3 {
@@ -3201,18 +3283,20 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
 
     @media (max-width: 980px) {
       .topbar { grid-template-columns: 1fr; }
-      .layout { grid-template-columns: 1fr; }
-      .upload-panel { position: static; }
       .dialog-shell { grid-template-columns: 1fr; }
       .dialog-preview { min-height: 46vh; border-right: 0; border-bottom: 1px solid var(--line); }
-      .resource-grid.list-view .card {
-        grid-template-columns: 104px minmax(0, 1fr);
-      }
     }
 
     @media (max-width: 640px) {
-      .shell { width: min(100vw - 20px, 1180px); padding-top: 20px; }
-      .hero-card, .hero-card img { min-height: 240px; }
+      .shell { width: min(100vw - 16px, 1180px); padding-top: 8px; }
+      .topbar { gap: 8px; margin-bottom: 10px; }
+      .hero-card, .hero-card img { min-height: 96px; height: 96px; }
+      .stat { position: absolute; right: 16px; top: 16px; min-width: 0; padding: 8px 10px; }
+      .stat strong { font-size: 1.25rem; }
+      .controls { padding: 10px; gap: 10px; }
+      .tab, .action { min-height: 44px; }
+      .resource-grid { padding: 10px; grid-template-columns: 1fr; }
+      .resource-grid.list-view { padding: 4px 8px 10px; }
       .grid-2 { grid-template-columns: 1fr; }
       .metro,
       .metro-fab {
@@ -3230,7 +3314,16 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       }
 
       .resource-grid.list-view .card {
-        grid-template-columns: 88px minmax(0, 1fr);
+        grid-template-columns: minmax(110px, 1fr) auto;
+        gap: 8px;
+      }
+      .resource-grid.list-view .meta { grid-column: 1; }
+      .resource-grid.list-view .actions {
+        grid-column: 2;
+        grid-row: 1 / span 2;
+      }
+      .resource-grid.list-view .actions .action:not(:first-child) {
+        display: none;
       }
     }
   </style>
@@ -3249,14 +3342,44 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     </header>
 
     <section class="layout">
+      <section class="panel library">
+        <div class="controls">
+          <div class="library-head">
+            <div class="tabs" id="tabs" aria-label="Sheet type filter">
+              <button class="tab active" data-tab="all" type="button">All</button>
+              <button class="tab" data-tab="pdf" type="button">PDFs</button>
+              <button class="tab" data-tab="image" type="button">Images</button>
+              <button class="tab" data-tab="chart" type="button">Charts</button>
+              <button class="tab" data-tab="other" type="button">Other</button>
+            </div>
+            <div class="library-actions">
+              <button class="primary auth-only" id="addSheetButton" type="button">Add sheet</button>
+              <button class="secondary" id="accountButton" type="button">Account</button>
+            </div>
+          </div>
+          <div class="view-toggle" id="viewToggle" aria-label="Library view toggle">
+            <button class="tab active" data-view="grid" type="button">Grid</button>
+            <button class="tab" data-view="list" type="button">List</button>
+          </div>
+          <label>
+            Search sheets
+            <input id="searchInput" type="search" placeholder="Title, artist, tags, key, notes, or text">
+          </label>
+        </div>
+        <div class="resource-grid" id="resourceGrid" aria-live="polite" aria-busy="true"></div>
+      </section>
+    </section>
+
+    <dialog class="actions-dialog" id="actionsDialog" aria-labelledby="actionsTitle">
       <aside class="panel upload-panel">
         <div class="panel-title">
           <img class="upload-logo" src="/assets/logo.png" alt="">
           <div>
-            <h2>Library actions</h2>
+            <h2 id="actionsTitle">Library actions</h2>
             <p class="panel-subtitle">Upload, login, and thumbnail maintenance live here.</p>
           </div>
           <span class="pill" id="authBadge">${authenticated ? `Signed in as ${escapeHtmlText(username || "account")}` : "Signed out"}</span>
+          <button class="close" id="closeActions" type="button" aria-label="Close library actions">✕</button>
         </div>
 
         <div class="tabs" id="sideTabs">
@@ -3320,11 +3443,11 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
 
               <p class="hint" id="typeHint"></p>
               <button class="primary" id="uploadButton" type="submit">Upload</button>
-              <div class="message" id="message"></div>
+              <div class="message" id="message" role="status" aria-live="polite"></div>
             </form>
             <div class="admin-meta guest-only">
-              <strong>Admin login required</strong>
-              <span>Use the Admin tab to sign in before uploading, editing, deleting, or refreshing thumbnails.</span>
+              <strong>Sign in required</strong>
+              <span>Sign in to upload sheets. Administrative maintenance remains restricted to administrators.</span>
             </div>
           </section>
 
@@ -3332,7 +3455,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
             <div class="admin-stack guest-only">
               <div class="admin-meta">
                 <strong>Sign in</strong>
-                <span>Uploads and maintenance tools are protected behind the admin account.</span>
+                <span>Sign in to browse and upload. Maintenance tools remain administrator-only.</span>
               </div>
               <form id="loginForm">
                 <label>
@@ -3344,7 +3467,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
                   <input id="loginPasswordInput" name="password" type="password" autocomplete="current-password" required>
                 </label>
                 <button class="primary" id="loginButton" type="submit">Sign in</button>
-                <div class="message" id="loginMessage"></div>
+                <div class="message" id="loginMessage" role="status" aria-live="polite"></div>
               </form>
             </div>
 
@@ -3353,35 +3476,16 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
                 <strong id="adminUserLabel">Admin</strong>
                 <span id="adminSessionLabel">Signed in.</span>
               </div>
-              <div class="admin-actions">
+              <div class="admin-actions admin-only">
                 <button class="secondary" id="refreshThumbsButton" type="button">Refresh thumbnails</button>
-                <button class="secondary danger" id="logoutButton" type="button">Sign out</button>
-                <div class="message" id="adminMessage"></div>
               </div>
+              <button class="secondary danger" id="logoutButton" type="button">Sign out</button>
+              <div class="message" id="adminMessage" role="status" aria-live="polite"></div>
             </div>
           </section>
         </div>
       </aside>
-
-      <section class="panel library">
-        <div class="controls">
-        <div class="tabs" id="tabs">
-          <button class="tab active" data-tab="all" type="button">All</button>
-          <button class="tab" data-tab="pdf" type="button">PDFs</button>
-          <button class="tab" data-tab="image" type="button">Images</button>
-          <button class="tab" data-tab="chart" type="button">Charts</button>
-          <button class="tab" data-tab="other" type="button">Other</button>
-        </div>
-        <div class="view-toggle" id="viewToggle" aria-label="Library view toggle">
-          <button class="tab active" data-view="grid" type="button">Grid</button>
-          <button class="tab" data-view="list" type="button">List</button>
-        </div>
-        <input id="searchInput" type="search" placeholder="Search by title, artist, tags, key, notes, or extracted text">
-      </div>
-
-        <div class="resource-grid" id="resourceGrid"></div>
-      </section>
-    </section>
+    </dialog>
   </main>
 
   <dialog class="dialog" id="sheetDialog">
@@ -3430,8 +3534,8 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
               <textarea id="detailNotesInput" name="notes" maxlength="2500"></textarea>
             </label>
             <button class="primary" id="detailSaveButton" type="submit">Save changes</button>
-            <button class="secondary danger" id="detailDeleteButton" type="button">Delete sheet</button>
-            <div class="message" id="detailMessage"></div>
+            <button class="secondary danger admin-only" id="detailDeleteButton" type="button">Delete sheet</button>
+            <div class="message" id="detailMessage" role="status" aria-live="polite"></div>
           </form>
         </section>
 
@@ -3491,13 +3595,17 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       activeTab: "all",
       viewMode: "grid",
       query: "",
+      catalogStatus: "loading",
+      catalogMessage: "",
       selectedResource: null,
       selectedResourceId: ""
     };
     const authState = ${JSON.stringify({
       authenticated,
       csrfToken,
-      username: username || ""
+      username: username || "",
+      userId: userId || "",
+      role: role || ""
     })};
 
     const kindLabels = {
@@ -3514,6 +3622,10 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     };
 
     const uploadForm = document.querySelector("#uploadForm");
+    const actionsDialog = document.querySelector("#actionsDialog");
+    const addSheetButton = document.querySelector("#addSheetButton");
+    const accountButton = document.querySelector("#accountButton");
+    const closeActions = document.querySelector("#closeActions");
     const titleInput = document.querySelector("#titleInput");
     const artistInput = document.querySelector("#artistInput");
     const kindInput = document.querySelector("#kindInput");
@@ -3579,6 +3691,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     };
 
     let activeDetailId = "";
+    let catalogRequest = 0;
 
     function setMessage(text, kind = "") {
       message.textContent = text;
@@ -3638,8 +3751,12 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     function setAuthUi(nextState) {
       authState.authenticated = Boolean(nextState && nextState.authenticated);
       authState.csrfToken = nextState && nextState.csrfToken ? String(nextState.csrfToken) : "";
-      authState.username = nextState && nextState.user ? String(nextState.user) : "";
+      authState.username = nextState && (nextState.user || nextState.username)
+        ? String(nextState.user || nextState.username) : "";
+      authState.userId = nextState && nextState.userId ? String(nextState.userId) : "";
+      authState.role = nextState && nextState.role ? String(nextState.role) : "";
       document.body.dataset.authenticated = authState.authenticated ? "1" : "0";
+      document.body.dataset.role = authState.role;
       authBadge.textContent = authState.authenticated
         ? "Signed in as " + (authState.username || "admin")
         : "Signed out";
@@ -3681,6 +3798,13 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         headers
       });
 
+      if (response.status === 401 && url !== "/api/auth/login") {
+        setAuthUi({ authenticated: false, csrfToken: "", user: "", userId: "", role: "" });
+        setSideTab("admin");
+        if (!actionsDialog.open) actionsDialog.showModal();
+        loginMessage.textContent = "Your session expired. Sign in to continue; unsaved form values were kept.";
+        loginMessage.className = "message error";
+      }
       return response;
     }
 
@@ -3697,30 +3821,97 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       });
     }
 
+    function persistBrowseState(push = false) {
+      const url = new URL(window.location.href);
+      if (state.activeTab === "all") url.searchParams.delete("kind");
+      else url.searchParams.set("kind", state.activeTab);
+      if (state.query) url.searchParams.set("q", state.query);
+      else url.searchParams.delete("q");
+      url.searchParams.set("view", state.viewMode);
+      history[push ? "pushState" : "replaceState"]({
+        kind: state.activeTab,
+        q: state.query,
+        view: state.viewMode,
+        scrollY: window.scrollY
+      }, "", url);
+      sessionStorage.setItem("mafusheets.scrollY", String(window.scrollY));
+    }
+
     async function loadResources() {
-      const response = await fetch("/api/resources?" + getQueryParams().toString());
-      const result = await response.json();
-      state.resources = result.resources || [];
-      state.total = result.total || 0;
+      const request = ++catalogRequest;
+      state.catalogStatus = "loading";
+      state.catalogMessage = "";
       render();
+      try {
+        const response = await apiFetch("/api/resources?" + getQueryParams().toString());
+        let result = {};
+        try { result = await response.json(); } catch {}
+        if (request !== catalogRequest) return;
+        if (!response.ok) {
+          if (response.status === 401) {
+            state.catalogStatus = "authentication";
+            state.catalogMessage = "Sign in to browse the library.";
+          } else if (response.status === 403) {
+            state.catalogStatus = "authorization";
+            state.catalogMessage = "You do not have permission to browse this library.";
+          } else {
+            state.catalogStatus = "error";
+            state.catalogMessage = result.error || "The catalog is temporarily unavailable.";
+          }
+          render();
+          return;
+        }
+        state.resources = Array.isArray(result.resources) ? result.resources : [];
+        state.total = Number(result.total) || 0;
+        state.catalogStatus = "ready";
+        render();
+      } catch {
+        if (request !== catalogRequest) return;
+        state.catalogStatus = "network";
+        state.catalogMessage = "The library could not be reached. Check your connection and retry.";
+        render();
+      }
     }
 
     function render() {
       totalCount.textContent = state.total;
       resourceGrid.classList.toggle("list-view", state.viewMode === "list");
+      resourceGrid.setAttribute("aria-busy", state.catalogStatus === "loading" ? "true" : "false");
 
+      if (state.catalogStatus === "loading") {
+        resourceGrid.innerHTML = '<div class="library-state">Loading library…</div>';
+        return;
+      }
+      if (state.catalogStatus !== "ready") {
+        const canRetry = state.catalogStatus === "error" || state.catalogStatus === "network";
+        resourceGrid.innerHTML = '<div class="library-state error"><strong>' +
+          escapeHtml(state.catalogMessage || "Library unavailable.") + '</strong>' +
+          (canRetry ? '<br><button class="action" data-retry-catalog type="button">Retry</button>' : '') +
+          '</div>';
+        return;
+      }
       if (!state.resources.length) {
-        resourceGrid.innerHTML = '<div class="empty">No sheets found.</div>';
+        const filtered = Boolean(state.query || state.activeTab !== "all");
+        resourceGrid.innerHTML = '<div class="library-state">' +
+          (filtered ? "No sheets match these filters." : "The library is empty.") + '</div>';
         return;
       }
 
       resourceGrid.innerHTML = state.resources.map(function(resource) {
-        const preview = resource.thumbnailUrl
-          ? '<img class="' + (resource.sheetKind === "pdf" ? "pdf-thumb" : resource.sheetKind === "image" ? "image-thumb" : "") + '" src="' + resource.thumbnailUrl + '" alt="">'
-          : '<div class="filemark">' + escapeHtml((kindLabels[resource.sheetKind] || resource.extension.replace(".", "")).toUpperCase()) + '</div>';
-        const previewWrap = resource.sheetKind === "pdf" && resource.readerUrl
-          ? '<a class="preview" href="' + resource.readerUrl + '">' + preview + '</a>'
-          : '<button class="preview" type="button" data-open="' + resource.id + '">' + preview + '</button>';
+        const thumbnailStatus = resource.thumbnailStatus || (resource.thumbnail && resource.thumbnail.status) || "";
+        const thumbnailReady = resource.thumbnailUrl && (!thumbnailStatus || thumbnailStatus === "ready");
+        const placeholderLabel = thumbnailStatus === "pending" || thumbnailStatus === "processing"
+          ? "Thumbnail processing"
+          : thumbnailStatus === "failed" || thumbnailStatus === "unavailable" || thumbnailStatus === "stale"
+            ? "Thumbnail unavailable"
+            : (kindLabels[resource.sheetKind] || resource.extension.replace(".", "")).toUpperCase();
+        const preview = thumbnailReady
+          ? '<img class="' + (resource.sheetKind === "pdf" ? "pdf-thumb" : resource.sheetKind === "image" ? "image-thumb" : "") + '" src="' + resource.thumbnailUrl + '" alt="" data-thumbnail>'
+          : '<div class="thumbnail-placeholder">' + escapeHtml(placeholderLabel) + '</div>';
+        const previewWrap = state.viewMode === "list" ? "" :
+          (resource.sheetKind === "pdf" && resource.readerUrl
+            ? '<a class="preview" href="' + resource.readerUrl + '">' + preview + '</a>'
+            : '<button class="preview" type="button" data-open="' + resource.id + '">' + preview + '</button>');
         const openAction = resource.sheetKind === "pdf" && resource.readerUrl
           ? '<a class="action" href="' + resource.readerUrl + '">Open</a>'
           : '<button class="action" type="button" data-open="' + resource.id + '">Open</button>';
@@ -3734,7 +3925,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         if (resource.bpm !== null && resource.bpm !== undefined && resource.bpm !== '') metaBits.push(escapeHtml(resource.bpm) + ' BPM');
         metaBits.push(formatDate(resource.uploadedAt));
 
-        return '<article class="card">' +
+        return '<article class="card" data-resource-id="' + resource.id + '">' +
           previewWrap +
           '<div class="card-body">' +
             '<h3>' + escapeHtml(resource.title) + '</h3>' +
@@ -3794,10 +3985,20 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       annotationPageInput.value = '';
       annotationTextInput.value = '';
       annotationColorInput.value = 'amber';
+      const canEdit = authState.role === "admin" || resource.uploadedBy === authState.userId;
+      Array.from(detailForm.elements).forEach(function(control) {
+        if (control !== detailDeleteButton) control.disabled = !canEdit;
+      });
+      detailDeleteButton.hidden = authState.role !== "admin";
 
       if (resource.canPreview) {
         if (resource.sheetKind === 'image') {
-          detailPreview.innerHTML = '<img class="image-thumb" src="' + resource.thumbnailUrl + '" alt="">';
+          const status = resource.thumbnailStatus || (resource.thumbnail && resource.thumbnail.status) || "";
+          if (resource.thumbnailUrl && (!status || status === "ready")) {
+            detailPreview.innerHTML = '<img class="image-thumb" src="' + resource.thumbnailUrl + '" alt="" data-thumbnail>';
+          } else {
+            detailPreview.innerHTML = '<div class="thumbnail-placeholder">Thumbnail unavailable. Use Preview or Download.</div>';
+          }
         } else {
           detailPreview.innerHTML = '<iframe src="' + (resource.readerUrl || resource.viewUrl) + '"></iframe>';
         }
@@ -3833,6 +4034,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       if (!activeDetailId) return;
 
       setDetailMessage('Saving changes...');
+      document.querySelector("#detailSaveButton").disabled = true;
       const body = {
         title: detailTitleInput.value,
         artist: detailArtistInput.value,
@@ -3843,21 +4045,25 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         notes: detailNotesInput.value
       };
 
-      const response = await apiFetch('/api/resources/' + encodeURIComponent(activeDetailId), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || 'Could not save changes.');
+      try {
+        const response = await apiFetch('/api/resources/' + encodeURIComponent(activeDetailId), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          const prefix = response.status === 400 ? "Check the entered values: " :
+            response.status === 401 ? "Sign in again: " :
+            response.status === 403 ? "Not authorized: " : "Could not save yet: ";
+          throw new Error(prefix + (result.error || 'Could not save changes.'));
+        }
+        setDetailMessage('Saved.', 'ok');
+        state.selectedResource = result.resource;
+        await loadResources();
+      } finally {
+        document.querySelector("#detailSaveButton").disabled = false;
       }
-
-      setDetailMessage('Saved.', 'ok');
-      state.selectedResource = result.resource;
-      await loadResources();
-      await openSheet(activeDetailId);
     }
 
     async function addAnnotation(event) {
@@ -3906,21 +4112,27 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     async function deleteResource() {
-      if (!window.confirm("Delete this sheet permanently?")) return;
+      if (!activeDetailId || authState.role !== "admin") return;
+      if (!window.confirm("Delete this sheet? Its source and thumbnail will be quarantined before cleanup.")) return;
 
       setDetailMessage("Deleting sheet...");
-      const response = await apiFetch('/api/resources/' + encodeURIComponent(activeDetailId), {
-        method: 'DELETE'
-      });
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || 'Could not delete sheet.');
+      detailDeleteButton.disabled = true;
+      try {
+        const response = await apiFetch('/api/resources/' + encodeURIComponent(activeDetailId), {
+          method: 'DELETE'
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          const prefix = response.status === 403 ? "Administrator access is required. " :
+            response.status >= 500 ? "Deletion or cleanup did not complete. The sheet remains visible. " : "";
+          throw new Error(prefix + (result.error || 'Could not delete sheet.'));
+        }
+        setDetailMessage('Sheet deleted.', 'ok');
+        sheetDialog.close();
+        await loadResources();
+      } finally {
+        detailDeleteButton.disabled = false;
       }
-
-      setDetailMessage('Sheet deleted.', 'ok');
-      sheetDialog.close();
-      await loadResources();
     }
 
     async function login(event) {
@@ -3948,7 +4160,9 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         setAuthUi({
           authenticated: true,
           csrfToken: result.csrfToken,
-          user: result.user
+          user: result.user,
+          userId: result.userId,
+          role: result.role
         });
         loginMessage.textContent = "Signed in.";
         loginMessage.className = "message ok";
@@ -4094,6 +4308,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         button.classList.toggle("active", button.dataset.view === state.viewMode);
       });
       localStorage.setItem("mafusheets.viewMode", state.viewMode);
+      persistBrowseState();
       render();
     }
 
@@ -4106,6 +4321,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     });
     searchInput.addEventListener('input', function() {
       state.query = searchInput.value;
+      persistBrowseState();
       debouncedLoadResources();
     });
 
@@ -4117,6 +4333,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       tabs.querySelectorAll('.tab').forEach(function(tab) {
         tab.classList.toggle('active', tab === button);
       });
+      persistBrowseState(true);
       loadResources();
     });
 
@@ -4127,12 +4344,30 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     });
 
     resourceGrid.addEventListener('click', function(event) {
+      if (event.target.closest('[data-retry-catalog]')) {
+        loadResources();
+        return;
+      }
       const button = event.target.closest('[data-open]');
       if (!button) return;
       openSheet(button.dataset.open).catch(function(error) {
         setMessage(error.message, 'error');
       });
     });
+
+    resourceGrid.addEventListener('error', function(event) {
+      const image = event.target.closest && event.target.closest('img[data-thumbnail]');
+      if (!image) return;
+      const placeholder = document.createElement("div");
+      placeholder.className = "thumbnail-placeholder";
+      placeholder.textContent = "Thumbnail unavailable";
+      image.replaceWith(placeholder);
+    }, true);
+
+    detailPreview.addEventListener('error', function(event) {
+      if (!event.target.matches('img[data-thumbnail]')) return;
+      detailPreview.innerHTML = '<div class="thumbnail-placeholder">Thumbnail unavailable. Use Preview or Download.</div>';
+    }, true);
 
     detailForm.addEventListener('submit', function(event) {
       saveDetails(event).catch(function(error) {
@@ -4185,6 +4420,22 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       sheetDialog.close();
     });
 
+    function openActions(tabName) {
+      setSideTab(tabName);
+      if (!actionsDialog.open) actionsDialog.showModal();
+      window.setTimeout(function() {
+        const target = tabName === "add" ? titleInput : loginUserInput;
+        if (target && target.offsetParent !== null) target.focus();
+      }, 0);
+    }
+
+    addSheetButton.addEventListener("click", function() { openActions("add"); });
+    accountButton.addEventListener("click", function() { openActions("admin"); });
+    closeActions.addEventListener("click", function() { actionsDialog.close(); });
+    actionsDialog.addEventListener("click", function(event) {
+      if (event.target === actionsDialog) actionsDialog.close();
+    });
+
     sheetDialog.addEventListener('click', function(event) {
       const rect = sheetDialog.getBoundingClientRect();
       const clickedInDialog = rect.top <= event.clientY && event.clientY <= rect.top + rect.height &&
@@ -4204,6 +4455,8 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       setMessage('');
       uploadButton.disabled = true;
       uploadButton.textContent = 'Uploading...';
+      const selectedFiles = Array.from(fileInput.files).map(function(file) { return file.name; });
+      setMessage("Uploading " + String(selectedFiles.length) + " file(s)…");
 
       const body = new FormData();
       body.append('title', titleInput.value);
@@ -4226,13 +4479,17 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         const result = await response.json();
 
         if (!response.ok) {
-          throw new Error(result.error || 'Upload failed.');
+          const names = selectedFiles.length ? " Selected files: " + selectedFiles.join(", ") + "." : "";
+          const prefix = response.status === 400 || response.status === 413 || response.status === 429
+            ? "Upload rejected. " : response.status === 403
+              ? "You are not authorized to upload. " : "Upload failed before completion. ";
+          throw new Error(prefix + (result.error || 'Please retry.') + names);
         }
 
         uploadForm.reset();
         kindInput.value = 'pdf';
         updateFileAccept();
-        setMessage('Upload complete.', 'ok');
+        setMessage('Upload accepted. Search and thumbnail processing may continue in the background.', 'ok');
         await loadResources();
       } catch (error) {
         setMessage(error.message, 'error');
@@ -4270,13 +4527,43 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       }
     });
 
+    window.addEventListener("scroll", function() {
+      sessionStorage.setItem("mafusheets.scrollY", String(window.scrollY));
+      const current = history.state || {};
+      history.replaceState({ ...current, scrollY: window.scrollY }, "", window.location.href);
+    }, { passive: true });
+
+    window.addEventListener("popstate", function(event) {
+      const params = new URLSearchParams(window.location.search);
+      state.activeTab = params.get("kind") || "all";
+      state.query = params.get("q") || "";
+      state.viewMode = params.get("view") === "list" ? "list" : "grid";
+      searchInput.value = state.query;
+      tabs.querySelectorAll("[data-tab]").forEach(function(tab) {
+        tab.classList.toggle("active", tab.dataset.tab === state.activeTab);
+      });
+      setViewMode(state.viewMode);
+      loadResources().then(function() {
+        const targetScroll = event.state && Number(event.state.scrollY);
+        if (Number.isFinite(targetScroll)) window.scrollTo(0, targetScroll);
+      });
+    });
+
+    const initialParams = new URLSearchParams(window.location.search);
+    state.activeTab = initialParams.get("kind") || "all";
+    state.query = initialParams.get("q") || "";
+    searchInput.value = state.query;
+    tabs.querySelectorAll("[data-tab]").forEach(function(tab) {
+      tab.classList.toggle("active", tab.dataset.tab === state.activeTab);
+    });
     setAuthUi(authState);
-    setSideTab(authState.authenticated ? 'add' : 'admin');
+    setSideTab(authState.authenticated ? "add" : "admin");
     updateFileAccept();
-    setViewMode(localStorage.getItem("mafusheets.viewMode") || "grid");
+    setViewMode(initialParams.get("view") || localStorage.getItem("mafusheets.viewMode") || "grid");
     initMetro();
-    loadResources().catch(function() {
-      setMessage('Could not load sheets.', 'error');
+    loadResources().then(function() {
+      const savedScroll = Number(sessionStorage.getItem("mafusheets.scrollY") || "0");
+      if (savedScroll > 0) window.scrollTo(0, savedScroll);
     });
   </script>
 </body>
