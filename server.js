@@ -5,6 +5,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
+const JSZip = require("jszip");
 const { normalizeSearchText } = require("./search-indexer");
 const { createCatalogStore, migrateLegacyCatalog, openDatabase } = require("./lib/database");
 const { createUserStore } = require("./lib/users");
@@ -441,6 +442,16 @@ function requireAuthenticated(req, res, next) {
   return next();
 }
 
+function requireApproved(req, res, next) {
+  return requireAuthenticated(req, res, () => {
+    if (req.adminSession.role !== "admin" && !req.adminSession.approved) {
+      auditRejected(req, "account_approval_required");
+      return res.status(403).json({ error: "Administrator approval is required." });
+    }
+    return next();
+  });
+}
+
 function requireAdmin(req, res, next) {
   return requireAuthenticated(req, res, () => {
     if (req.adminSession.role !== "admin") {
@@ -474,7 +485,14 @@ function requireCsrf(req, res, next) {
 }
 
 function issueSession(user) {
-  return { ...sessionStore.issue(user.id), user: user.loginIdentifier, userId: user.id, role: user.role };
+  return {
+    ...sessionStore.issue(user.id),
+    user: user.loginIdentifier,
+    displayName: user.displayName,
+    userId: user.id,
+    role: user.role
+    ,approved: user.approved
+  };
 }
 
 function revokeSession(token) {
@@ -550,6 +568,18 @@ async function requireAnnotationOwner(req, res, next) {
 async function readIndex() {
   if (!catalogStore) throw new Error("Catalog database is not initialized.");
   return catalogStore.listResources();
+}
+
+function canViewResource(resource, session) {
+  return resource && (
+    resource.visibility === "guest" ||
+    Boolean(session && (session.role === "admin" || session.approved))
+  );
+}
+
+async function visibleResource(req, id) {
+  const resource = getResourceById(await readIndex(), id);
+  return canViewResource(resource, req.adminSession || getSession(req)) ? resource : null;
 }
 
 function cleanText(value, limit = 120) {
@@ -689,6 +719,14 @@ function fullResource(resource) {
     ...publicResource(resource),
     annotations: Array.isArray(resource.annotations) ? resource.annotations : []
   };
+}
+
+function guestResource(resource) {
+  const safe = publicResource(resource);
+  delete safe.uploadedBy;
+  delete safe.updatedBy;
+  delete safe.notes;
+  return safe;
 }
 
 function resourceMatchesQuery(resource, query) {
@@ -972,17 +1010,15 @@ function enqueueProcessing(resource, actorUserId) {
 
 app.get("/", allowPublic, (req, res) => {
   const session = getSession(req);
-  if (!session) {
-    return res.type("html").send(renderLoginHtml());
-  }
-
   res.type("html").send(renderMainHtml({
-    authenticated: true,
-    csrfToken: session.csrfToken,
-    username: session.user,
-    userId: session.userId,
-    role: session.role,
-    mustChangePassword: session.mustChangePassword
+    authenticated: Boolean(session),
+    csrfToken: session?.csrfToken || "",
+    username: session?.user || "",
+    displayName: session?.displayName || "",
+    userId: session?.userId || "",
+    role: session?.role || "",
+    approved: Boolean(session?.approved),
+    mustChangePassword: Boolean(session?.mustChangePassword)
   }));
 });
 
@@ -1059,8 +1095,10 @@ app.get("/api/auth/me", requireAuthenticated, (req, res) => {
   res.json({
     authenticated: true,
     user: session.user,
+    displayName: session.displayName,
     userId: session.userId,
     role: session.role,
+    approved: session.approved,
     mustChangePassword: session.mustChangePassword,
     csrfToken: session.csrfToken
   });
@@ -1091,11 +1129,36 @@ app.post("/api/auth/login", allowPublic, authLimiter, requireSameOrigin, async (
   res.json({
     ok: true,
     user: session.user,
+    displayName: session.displayName,
     userId: session.userId,
     role: session.role,
+    approved: session.approved,
     mustChangePassword: user.mustChangePassword,
     csrfToken: session.csrfToken
   });
+});
+
+app.post("/api/auth/register", allowPublic, authLimiter, requireSameOrigin, async (req, res) => {
+  try {
+    const user = await userStore.register({
+      loginIdentifier: req.body && req.body.loginIdentifier,
+      displayName: req.body && req.body.displayName,
+      password: req.body && req.body.password
+    });
+    const session = issueSession(user);
+    setSessionCookie(res, session.token);
+    res.status(201).json({
+      ok: true,
+      user: session.user,
+      displayName: session.displayName,
+      userId: session.userId,
+      role: session.role,
+      approved: session.approved,
+      csrfToken: session.csrfToken
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.post("/api/auth/logout", requireAuthenticated, requireSameOrigin, requireCsrf, (req, res) => {
@@ -1103,6 +1166,19 @@ app.post("/api/auth/logout", requireAuthenticated, requireSameOrigin, requireCsr
   revokeSession(req.adminSession.token);
   clearSessionCookie(res);
   res.json({ ok: true });
+});
+
+app.patch("/api/account/profile", requireAuthenticated, requireSameOrigin, requireCsrf, async (req, res) => {
+  try {
+    const user = await userStore.updateOwnProfile(
+      req.adminSession.userId,
+      req.body && req.body.displayName,
+      req.body && req.body.currentPassword
+    );
+    res.json({ user });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.post("/api/auth/change-password", requireAuthenticated, requireSameOrigin, requireCsrf, async (req, res) => {
@@ -1120,39 +1196,65 @@ app.post("/api/auth/change-password", requireAuthenticated, requireSameOrigin, r
   }
 });
 
-app.get("/api/resources", requireAuthenticated, async (req, res) => {
+app.get("/api/resources", async (req, res) => {
+  req.adminSession = getSession(req);
   const activeKind = String(req.query.kind || "all").trim().toLowerCase();
   const query = String(req.query.q || "");
-  const resources = await readIndex();
+  const sort = String(req.query.sort || "newest").trim().toLowerCase();
+  const mineOnly = String(req.query.mine || "") === "1";
+  const allResources = await readIndex();
+  const resources = allResources.filter((resource) =>
+    canViewResource(resource, req.adminSession)
+  );
   const filtered = resources.filter((resource) => {
     const kind = resource.sheetKind || sheetKindForExtension(resource.extension);
     const inKind = activeKind === "all" || kind === activeKind;
-    return inKind && resourceMatchesQuery(resource, query);
+    return inKind && (!mineOnly || resource.uploadedBy === req.adminSession?.userId) &&
+      resourceMatchesQuery(resource, query);
   });
 
-  filtered.sort((a, b) =>
-    new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+  const titleOrder = (a, b) => String(a.title || "").localeCompare(
+    String(b.title || ""), undefined, { numeric: true, sensitivity: "base" }
   );
+  const dateOrder = (a, b) =>
+    new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime();
+  if (sort === "title-asc") filtered.sort(titleOrder);
+  else if (sort === "title-desc") filtered.sort((a, b) => titleOrder(b, a));
+  else if (sort === "oldest") filtered.sort((a, b) => dateOrder(b, a));
+  else filtered.sort(dateOrder);
 
   res.json({
     total: resources.length,
     count: filtered.length,
-    resources: filtered.map(publicResource)
+    resources: filtered.map((resource) => ({
+      ...(req.adminSession && (req.adminSession.role === "admin" || req.adminSession.approved)
+        ? publicResource(resource) : guestResource(resource)),
+      ...(req.adminSession && (req.adminSession.role === "admin" || req.adminSession.approved)
+        ? { uploadedByDisplayName:
+            userStore.getUserById(resource.uploadedBy)?.displayName || "Unknown user" }
+        : {})
+    }))
   });
 });
 
-app.get("/api/resources/:id", requireAuthenticated, async (req, res) => {
-  const resources = await readIndex();
-  const resource = getResourceById(resources, req.params.id);
+app.get("/api/resources/:id", async (req, res) => {
+  req.adminSession = getSession(req);
+  const resource = await visibleResource(req, req.params.id);
 
   if (!resource) {
     return res.status(404).json({ error: "Sheet not found." });
   }
 
-  res.json({ resource: fullResource(resource) });
+  const mayUseMemberFeatures = Boolean(
+    req.adminSession && (req.adminSession.role === "admin" || req.adminSession.approved)
+  );
+  res.json({ resource: mayUseMemberFeatures ? {
+    ...fullResource(resource),
+    uploadedByDisplayName: userStore.getUserById(resource.uploadedBy)?.displayName || "Unknown user"
+  } : guestResource(resource) });
 });
 
-app.patch("/api/resources/:id", requireAuthenticated, requireSameOrigin, requireCsrf, requireResourceEditor, async (req, res) => {
+app.patch("/api/resources/:id", requireApproved, requireSameOrigin, requireCsrf, requireResourceEditor, async (req, res) => {
   recordAudit(req, "resource_modification_requested", "resource", req.params.id, { operation: "edit" });
   const updates = {
     title: cleanText(req.body.title, 120),
@@ -1182,7 +1284,7 @@ app.patch("/api/resources/:id", requireAuthenticated, requireSameOrigin, require
 
 app.post(
   "/api/resources/:id/file",
-  requireAuthenticated,
+  requireApproved,
   requireSameOrigin,
   requireCsrf,
   requireResourceEditor,
@@ -1274,7 +1376,7 @@ app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, a
   }
 });
 
-app.post("/api/resources/:id/annotations", requireAuthenticated, requireSameOrigin, requireCsrf, async (req, res) => {
+app.post("/api/resources/:id/annotations", requireApproved, requireSameOrigin, requireCsrf, async (req, res) => {
   recordAudit(req, "resource_modification_requested", "resource", req.params.id, { operation: "annotation_create" });
   const page = cleanNumber(req.body.page, { min: 1, max: 9999 });
   const text = cleanText(req.body.text, 500);
@@ -1296,7 +1398,7 @@ app.post("/api/resources/:id/annotations", requireAuthenticated, requireSameOrig
   }
 });
 
-app.delete("/api/resources/:id/annotations/:annotationId", requireAuthenticated, requireSameOrigin, requireCsrf, requireAnnotationOwner, async (req, res) => {
+app.delete("/api/resources/:id/annotations/:annotationId", requireApproved, requireSameOrigin, requireCsrf, requireAnnotationOwner, async (req, res) => {
   recordAudit(req, "resource_modification_requested", "annotation", req.params.annotationId, { operation: "annotation_delete" });
   try {
     const result = resourceStore.deleteAnnotation(
@@ -1315,7 +1417,7 @@ app.delete("/api/resources/:id/annotations/:annotationId", requireAuthenticated,
 app.post(
   "/api/upload",
   uploadLimiter,
-  requireAuthenticated,
+  requireApproved,
   requireSameOrigin,
   requireCsrf,
   limitConcurrentUserUploads,
@@ -1428,6 +1530,110 @@ app.post("/api/admin/thumbnails/refresh", requireAdmin, requireSameOrigin, requi
   }
 });
 
+app.get("/api/admin/users", requireAdmin, (_req, res) => {
+  res.json({ users: userStore.listUsers() });
+});
+
+app.post("/api/admin/users", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
+  try {
+    const user = await userStore.createUser({
+      loginIdentifier: req.body && req.body.loginIdentifier,
+      displayName: req.body && req.body.displayName,
+      password: req.body && req.body.password,
+      role: req.body && req.body.role || "member",
+      mustChangePassword: req.body && req.body.mustChangePassword !== false,
+      operator: { actorUserId: req.adminSession.userId, mode: "administrator" }
+    });
+    res.status(201).json({ user });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/admin/users/:id", requireAdmin, requireSameOrigin, requireCsrf, (req, res) => {
+  try {
+    const operator = { actorUserId: req.adminSession.userId, mode: "administrator" };
+    let user = userStore.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found." });
+    if (
+      req.params.id === req.adminSession.userId && req.body &&
+      (Object.hasOwn(req.body, "role") || Object.hasOwn(req.body, "enabled"))
+    ) {
+      return res.status(400).json({ error: "You cannot change your own role or enabled status." });
+    }
+    if (
+      req.body &&
+      (Object.hasOwn(req.body, "loginIdentifier") || Object.hasOwn(req.body, "displayName"))
+    ) {
+      user = userStore.updateIdentity(req.params.id, {
+        loginIdentifier: req.body.loginIdentifier,
+        displayName: req.body.displayName
+      }, operator);
+    }
+    if (req.body && Object.hasOwn(req.body, "role")) {
+      user = userStore.setRole(req.params.id, req.body.role, operator);
+    }
+    if (req.body && Object.hasOwn(req.body, "enabled")) {
+      user = userStore.setEnabled(req.params.id, Boolean(req.body.enabled), operator);
+    }
+    if (req.body && Object.hasOwn(req.body, "approved")) {
+      user = userStore.setApproved(req.params.id, Boolean(req.body.approved), operator);
+    }
+    res.json({ user });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch(
+  "/api/admin/resources/:id/visibility",
+  requireAdmin,
+  requireSameOrigin,
+  requireCsrf,
+  (req, res) => {
+    const visibility = String(req.body && req.body.visibility || "");
+    if (!["guest", "restricted"].includes(visibility)) {
+      return res.status(400).json({ error: "Visibility must be guest or restricted." });
+    }
+    const current = database.prepare(
+      "SELECT visibility FROM resources WHERE id=? AND deleted_at IS NULL"
+    ).get(req.params.id);
+    if (!current) return res.status(404).json({ error: "Sheet not found." });
+    const timestamp = new Date().toISOString();
+    database.transaction(() => {
+      database.prepare(`
+        UPDATE resources SET visibility=?, updated_by=?, updated_at=? WHERE id=?
+      `).run(visibility, req.adminSession.userId, timestamp, req.params.id);
+      auditEvent(database, {
+        actorUserId: req.adminSession.userId,
+        eventType: "resource_visibility_changed",
+        entityType: "resource",
+        entityId: req.params.id,
+        details: { from: current.visibility, to: visibility }
+      });
+    })();
+    res.json({ ok: true, visibility });
+  }
+);
+
+app.post(
+  "/api/admin/users/:id/reset-password",
+  requireAdmin,
+  requireSameOrigin,
+  requireCsrf,
+  async (req, res) => {
+    try {
+      const user = await userStore.resetPassword(req.params.id, req.body && req.body.password, {
+        mustChangePassword: req.body && req.body.mustChangePassword !== false,
+        operator: { actorUserId: req.adminSession.userId, mode: "administrator" }
+      });
+      res.json({ user });
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+);
+
 app.post("/api/admin/staging/cleanup", requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => {
   recordAudit(req, "maintenance_requested", "catalog", null, { operation: "staging_cleanup" });
   const removed = await cleanupStaleStaging();
@@ -1448,9 +1654,9 @@ app.get("/api/admin/integrity", requireAdmin, async (req, res) => {
   res.status(report.ok ? 200 : 409).json(report);
 });
 
-app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
-  const resources = await readIndex();
-  const resource = getResourceById(resources, req.params.id);
+app.get("/sheets/:id", async (req, res) => {
+  req.adminSession = getSession(req);
+  const resource = await visibleResource(req, req.params.id);
   const session = getSession(req);
 
   if (!resource) {
@@ -1469,16 +1675,16 @@ app.get("/sheets/:id", requireAuthenticated, async (req, res) => {
   }
 
   res.type("html").send(renderReaderHtml(resource.id, {
-    authenticated: Boolean(session),
+    authenticated: Boolean(session && (session.role === "admin" || session.approved)),
     csrfToken: session ? session.csrfToken : "",
     username: session ? session.user : "",
     role: session ? session.role : ""
   }));
 });
 
-app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
-  const resources = await readIndex();
-  const resource = getResourceById(resources, req.params.id);
+app.get("/thumbnails/:id.png", async (req, res) => {
+  req.adminSession = getSession(req);
+  const resource = await visibleResource(req, req.params.id);
 
   if (!resource) {
     return res.status(404).send("Thumbnail not found.");
@@ -1498,9 +1704,9 @@ app.get("/thumbnails/:id.png", requireAuthenticated, async (req, res) => {
   }
 });
 
-app.get("/files/:id", requireAuthenticated, async (req, res) => {
-  const resources = await readIndex();
-  const resource = resources.find((item) => item.id === req.params.id);
+app.get("/files/:id", async (req, res) => {
+  req.adminSession = getSession(req);
+  const resource = await visibleResource(req, req.params.id);
 
   if (!resource) {
     return res.status(404).send("File not found.");
@@ -1518,6 +1724,49 @@ app.get("/files/:id", requireAuthenticated, async (req, res) => {
   res.setHeader("Content-Type", type);
   res.setHeader("Content-Disposition", `${disposition}; filename="${encodeURIComponent(resource.originalName)}"`);
   res.sendFile(resolved);
+});
+
+app.get("/assets/pdf.mjs", allowPublic, (_req, res) => {
+  res.type("text/javascript").sendFile(path.join(ROOT, "node_modules", "pdfjs-dist", "build", "pdf.mjs"));
+});
+
+app.get("/assets/pdf.worker.mjs", allowPublic, (_req, res) => {
+  res.type("text/javascript").sendFile(
+    path.join(ROOT, "node_modules", "pdfjs-dist", "build", "pdf.worker.mjs")
+  );
+});
+
+app.get("/api/admin/uploads-backup.zip", requireAdmin, async (req, res) => {
+  const resources = await readIndex();
+  const zip = new JSZip();
+  const manifest = {
+    format: "mafusheets-upload-backup-v1",
+    createdAt: new Date().toISOString(),
+    resources: resources.map((resource) => fullResource(resource))
+  };
+
+  for (const resource of resources) {
+    const source = resolveResourceFile(resource);
+    if (!source) continue;
+    const stat = await fsp.lstat(source).catch(() => null);
+    if (!stat || !stat.isFile() || stat.isSymbolicLink()) continue;
+    const folder = String(resource.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const filename = path.basename(resource.originalName || resource.storedName);
+    zip.file(`uploads/${folder}/${filename}`, fs.createReadStream(source));
+  }
+
+  zip.file("backup-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+  recordAudit(req, "maintenance_requested", "catalog", null, { operation: "uploads_backup" });
+  const date = new Date().toISOString().slice(0, 10);
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="mafusheets-uploads-${date}.zip"`);
+  zip.generateNodeStream({ type: "nodebuffer", streamFiles: true, compression: "DEFLATE" })
+    .on("error", (error) => {
+      safeLogError("uploads backup failed", error);
+      if (!res.headersSent) res.status(500).send("Backup generation failed.");
+      else res.destroy(error);
+    })
+    .pipe(res);
 });
 
 app.use((error, _req, res, next) => {
@@ -1690,6 +1939,10 @@ function renderReaderHtml(
       background: #1d1f24;
     }
 
+    .mobile-pdf {
+      display: none;
+    }
+
     .drawer {
       position: fixed;
       top: 54px;
@@ -1832,12 +2085,22 @@ function renderReaderHtml(
     }
 
     @media (max-width: 720px) {
+      body {
+        height: auto;
+        min-height: 100dvh;
+        overflow: auto;
+      }
+
       .reader {
-        grid-template-rows: 96px minmax(0, 1fr);
+        grid-template-rows: auto minmax(calc(100dvh - 150px), auto);
+        min-height: 100dvh;
+        height: auto;
       }
 
       .reader-bar {
         grid-template-columns: auto 1fr;
+        gap: 10px;
+        padding: 9px 10px 12px;
       }
 
       .reader-title {
@@ -1848,16 +2111,52 @@ function renderReaderHtml(
 
       .reader-actions {
         grid-column: 1 / -1;
-        justify-content: stretch;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
       }
 
       .reader-actions .text-button,
       .reader-actions .primary {
-        flex: 1;
+        width: 100%;
+        min-height: 44px;
+        padding: 7px 10px;
+        text-align: center;
+      }
+
+      .reader-auth-badge {
+        grid-column: 1 / -1;
+      }
+
+      .pdf-frame {
+        display: none;
+      }
+
+      .mobile-pdf {
+        display: grid;
+        gap: 12px;
+        min-height: calc(100dvh - 150px);
+        padding: 12px;
+        background: #1d1f24;
+      }
+
+      .pdf-page {
+        display: block;
+        width: 100%;
+        height: auto;
+        background: #fff;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, .35);
+      }
+
+      .pdf-status {
+        align-self: start;
+        color: var(--muted);
+        padding: 20px;
+        text-align: center;
       }
 
       .drawer {
-        top: 96px;
+        top: 0;
         width: 100%;
         border-left: 0;
       }
@@ -1877,8 +2176,8 @@ function renderReaderHtml(
         <span class="reader-meta" id="readerMeta"></span>
       </div>
       <div class="reader-actions">
-        <span class="text-button" id="readerAuthBadge" aria-hidden="true">${authenticated ? `Admin: ${escapeHtmlText(username || "admin")}` : "Admin login needed"}</span>
-        <a class="text-button" id="rawPdfLink" href="#" target="_blank" rel="noopener">PDF tab</a>
+        <span class="text-button reader-auth-badge" id="readerAuthBadge" aria-hidden="true">${authenticated ? `Admin: ${escapeHtmlText(username || "admin")}` : "Admin login needed"}</span>
+        <a class="text-button" id="rawPdfLink" href="#" target="_blank" rel="noopener">Open in new tab</a>
         <a class="text-button" id="downloadLink" href="#">Download</a>
         <button class="primary" id="toggleDrawer" type="button">Edit / notes</button>
       </div>
@@ -1886,6 +2185,9 @@ function renderReaderHtml(
 
     <section class="reader-stage">
       <iframe class="pdf-frame" id="pdfFrame" title="PDF sheet"></iframe>
+      <div class="mobile-pdf" id="mobilePdf" aria-label="PDF pages">
+        <div class="pdf-status" id="pdfStatus">Loading PDF pages...</div>
+      </div>
     </section>
   </main>
 
@@ -1935,6 +2237,9 @@ function renderReaderHtml(
           </label>
           <button class="primary" id="saveButton" type="submit">Save changes</button>
           <button class="secondary danger" id="deleteButton" type="button">Delete sheet</button>
+          ${role === "admin"
+            ? '<button class="secondary" id="visibilityButton" type="button">Publish to guest library</button>'
+            : ""}
           <div class="message" id="detailMessage"></div>
         </form>
       </section>
@@ -1973,12 +2278,15 @@ function renderReaderHtml(
     const authState = ${JSON.stringify({
       authenticated,
       csrfToken,
-      username: username || ""
+      username: username || "",
+      role: role || ""
     })};
     const kindLabels = { pdf: "PDF", image: "Image", chart: "Chart", other: "Other" };
     const readerTitle = document.querySelector("#readerTitle");
     const readerMeta = document.querySelector("#readerMeta");
     const pdfFrame = document.querySelector("#pdfFrame");
+    const mobilePdf = document.querySelector("#mobilePdf");
+    const pdfStatus = document.querySelector("#pdfStatus");
     const rawPdfLink = document.querySelector("#rawPdfLink");
     const downloadLink = document.querySelector("#downloadLink");
     const readerAuthBadge = document.querySelector("#readerAuthBadge");
@@ -1995,12 +2303,47 @@ function renderReaderHtml(
     const notesInput = document.querySelector("#notesInput");
     const detailMessage = document.querySelector("#detailMessage");
     const deleteButton = document.querySelector("#deleteButton");
+    const visibilityButton = document.querySelector("#visibilityButton");
     const annotationForm = document.querySelector("#annotationForm");
     const annotationPageInput = document.querySelector("#annotationPageInput");
     const annotationTextInput = document.querySelector("#annotationTextInput");
     const annotationColorInput = document.querySelector("#annotationColorInput");
     const annotationList = document.querySelector("#annotationList");
     let resource = null;
+    let renderedPdfUrl = "";
+
+    async function renderMobilePdf(url) {
+      if (!window.matchMedia("(max-width: 720px)").matches || renderedPdfUrl === url) return;
+      renderedPdfUrl = url;
+      pdfStatus.textContent = "Loading PDF pages...";
+      try {
+        const pdfjs = await import("/assets/pdf.mjs");
+        pdfjs.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.mjs";
+        const pdf = await pdfjs.getDocument({ url, withCredentials: true }).promise;
+        mobilePdf.replaceChildren();
+        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+          const page = await pdf.getPage(pageNumber);
+          const baseViewport = page.getViewport({ scale: 1 });
+          const displayWidth = Math.max(280, mobilePdf.clientWidth - 24);
+          const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+          const viewport = page.getViewport({
+            scale: displayWidth * pixelRatio / baseViewport.width
+          });
+          const canvas = document.createElement("canvas");
+          canvas.className = "pdf-page";
+          canvas.width = Math.floor(viewport.width);
+          canvas.height = Math.floor(viewport.height);
+          canvas.style.aspectRatio = String(viewport.width) + " / " + String(viewport.height);
+          canvas.setAttribute("aria-label", "Page " + String(pageNumber));
+          mobilePdf.appendChild(canvas);
+          await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+        }
+      } catch (_error) {
+        renderedPdfUrl = "";
+        pdfStatus.textContent = "This PDF could not be displayed here. Use Open in new tab or Download.";
+        mobilePdf.replaceChildren(pdfStatus);
+      }
+    }
 
     function escapeHtml(value) {
       return String(value || "").replace(/[&<>"']/g, function(char) {
@@ -2018,6 +2361,7 @@ function renderReaderHtml(
       authState.authenticated = Boolean(nextState && nextState.authenticated);
       authState.csrfToken = nextState && nextState.csrfToken ? String(nextState.csrfToken) : "";
       authState.username = nextState && nextState.user ? String(nextState.user) : "";
+      authState.role = nextState && nextState.role ? String(nextState.role) : authState.role || "";
       document.body.dataset.authenticated = authState.authenticated ? "1" : "0";
       readerAuthBadge.textContent = authState.authenticated
         ? "Admin: " + (authState.username || "admin")
@@ -2112,8 +2456,13 @@ function renderReaderHtml(
       if (pdfFrame.src !== item.viewUrl) {
         pdfFrame.src = item.viewUrl;
       }
+      renderMobilePdf(item.viewUrl);
       fillForm(item);
       renderAnnotations(item.annotations || []);
+      if (visibilityButton) {
+        visibilityButton.textContent = item.visibility === "guest"
+          ? "Remove from guest library" : "Publish to guest library";
+      }
     }
 
     async function loadResource() {
@@ -2214,6 +2563,33 @@ function renderReaderHtml(
       window.location.href = "/";
     }
 
+    async function changeResourceVisibility() {
+      if (!resource || authState.role !== "admin" || !visibilityButton) return;
+      const visibility = resource.visibility === "guest" ? "restricted" : "guest";
+      visibilityButton.disabled = true;
+      try {
+        const response = await apiFetch(
+          "/api/admin/resources/" + encodeURIComponent(resource.id) + "/visibility",
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ visibility: visibility })
+          }
+        );
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not change visibility.");
+        resource.visibility = result.visibility;
+        visibilityButton.textContent = result.visibility === "guest"
+          ? "Remove from guest library" : "Publish to guest library";
+        setDetailMessage(result.visibility === "guest"
+          ? "Published to the guest library." : "Restricted to approved members.", "ok");
+      } catch (error) {
+        setDetailMessage(error.message, "error");
+      } finally {
+        visibilityButton.disabled = false;
+      }
+    }
+
     toggleDrawer.addEventListener("click", function() {
       document.body.classList.toggle("drawer-open");
     });
@@ -2233,6 +2609,10 @@ function renderReaderHtml(
         setDetailMessage(error.message, "error");
       });
     });
+
+    if (visibilityButton) {
+      visibilityButton.addEventListener("click", changeResourceVisibility);
+    }
 
     annotationForm.addEventListener("submit", function(event) {
       addAnnotation(event).catch(function(error) {
@@ -2456,8 +2836,8 @@ function renderLoginHtml() {
 }
 
 function renderMainHtml({
-  authenticated = false, csrfToken = "", username = "", userId = "", role = "",
-  mustChangePassword = false
+  authenticated = false, csrfToken = "", username = "", displayName = "", userId = "", role = "",
+  approved = false, mustChangePassword = false
 } = {}) {
   return `<!doctype html>
 <html lang="en">
@@ -2505,16 +2885,12 @@ function renderMainHtml({
     }
 
     .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 18px;
-      align-items: start;
-      margin-bottom: 24px;
+      margin-bottom: 18px;
     }
 
     .hero-card {
       position: relative;
-      min-height: 310px;
+      height: 240px;
       overflow: hidden;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -2527,7 +2903,6 @@ function renderMainHtml({
     .hero-card img {
       width: 100%;
       height: 100%;
-      min-height: 310px;
       object-fit: cover;
       display: block;
     }
@@ -2573,29 +2948,20 @@ function renderMainHtml({
       max-width: 60ch;
     }
 
-    .stat {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 10px;
+    .library-title {
+      display: flex;
+      gap: 8px;
       align-items: baseline;
-      min-width: 144px;
-      border: 1px solid var(--line);
-      background: rgba(25, 27, 33, .78);
-      border-radius: 8px;
-      padding: 14px 16px;
-      text-align: left;
-      box-shadow: var(--shadow);
     }
 
-    .stat strong {
-      display: block;
-      font-size: 2.1rem;
-      line-height: 1;
+    .library-title h1 {
+      margin: 0;
+      font-size: 1.08rem;
     }
 
-    .stat span {
+    .sheet-count {
       color: var(--muted);
-      font-size: .92rem;
+      font-size: .84rem;
       white-space: nowrap;
     }
 
@@ -2633,6 +2999,10 @@ function renderMainHtml({
     .actions-dialog .upload-panel { box-shadow: var(--shadow); }
     .panel-title .close { flex: 0 0 auto; }
 
+    body[data-authenticated="0"] #actionsDialog {
+      width: min(460px, calc(100vw - 24px));
+    }
+
     .tab-panels {
       display: grid;
       gap: 14px;
@@ -2660,6 +3030,16 @@ function renderMainHtml({
       gap: 12px;
     }
 
+    .admin-stack[hidden] {
+      display: none;
+    }
+
+    body[data-authenticated="0"] #sideTabs,
+    body[data-authenticated="0"] #authBadge,
+    body[data-authenticated="0"] #actionsSubtitle {
+      display: none;
+    }
+
     .admin-meta {
       display: grid;
       gap: 8px;
@@ -2673,14 +3053,28 @@ function renderMainHtml({
       font-size: .98rem;
     }
 
+    .signin-intro {
+      margin: -2px 0 2px;
+      color: var(--muted);
+      font-size: .92rem;
+      line-height: 1.5;
+    }
+
     .admin-actions {
       display: grid;
       gap: 10px;
     }
 
     .admin-actions .secondary,
-    .admin-actions .primary {
+    .admin-actions .primary,
+    .admin-actions .backup-link {
       width: 100%;
+    }
+
+    .backup-link {
+      display: inline-grid;
+      place-items: center;
+      text-decoration: none;
     }
 
     body[data-authenticated="1"] .guest-only,
@@ -2690,6 +3084,10 @@ function renderMainHtml({
 
     body:not([data-authenticated="1"]) .requires-auth {
       display: none;
+    }
+
+    body:not([data-approved="1"]):not([data-role="admin"]) .requires-approved {
+      display: none !important;
     }
 
     body:not([data-role="admin"]) .admin-only {
@@ -2764,6 +3162,12 @@ function renderMainHtml({
       min-height: auto;
     }
 
+    input[type="checkbox"] {
+      width: auto;
+      min-height: auto;
+      margin-right: 6px;
+    }
+
     .hint {
       margin: -4px 0 0;
       color: var(--muted);
@@ -2777,6 +3181,8 @@ function renderMainHtml({
       border-radius: 8px;
       font-weight: 750;
       cursor: pointer;
+      transition: transform .15s ease, border-color .15s ease, background-color .15s ease,
+        box-shadow .15s ease;
     }
 
     .primary {
@@ -2856,6 +3262,42 @@ function renderMainHtml({
       flex-wrap: wrap;
     }
 
+    .browse-tools {
+      display: grid;
+      grid-template-columns: auto minmax(220px, 1fr) minmax(160px, auto);
+      gap: 12px;
+      align-items: end;
+    }
+
+    .browse-tools label { min-width: 0; }
+
+    .user-management {
+      display: grid;
+      gap: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+
+    .user-management h3 { margin: 0; font-size: 1rem; }
+
+    .user-list { display: grid; gap: 8px; }
+
+    .user-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 8px 12px;
+      align-items: start;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #14161b;
+    }
+
+    .user-row strong, .user-row span { overflow-wrap: break-word; }
+    .user-row .hint { margin: 2px 0 0; }
+    .user-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: start; }
+    .user-actions .secondary { min-height: 38px; padding: 6px 10px; }
+
     .tab {
       border: 1px solid var(--line);
       background: #14161b;
@@ -2865,6 +3307,8 @@ function renderMainHtml({
       border-radius: 8px;
       cursor: pointer;
       white-space: nowrap;
+      transition: transform .15s ease, border-color .15s ease, background-color .15s ease,
+        color .15s ease;
     }
 
     .tab.active {
@@ -2875,8 +3319,8 @@ function renderMainHtml({
 
     .resource-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-      gap: 12px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
       padding: 16px;
     }
 
@@ -2893,6 +3337,7 @@ function renderMainHtml({
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel-soft);
+      transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
     }
 
     .resource-grid.list-view .card {
@@ -3057,6 +3502,24 @@ function renderMainHtml({
       text-decoration: none;
       font-size: .86rem;
       cursor: pointer;
+      transition: transform .15s ease, border-color .15s ease, background-color .15s ease;
+    }
+
+    @media (hover: hover) and (pointer: fine) {
+      .card:hover {
+        transform: translateY(-2px);
+        border-color: rgba(124, 77, 255, .5);
+        box-shadow: 0 12px 28px rgba(0, 0, 0, .24);
+      }
+
+      .primary:hover, .secondary:hover, .tab:hover, .action:hover, .close:hover {
+        transform: translateY(-1px);
+        border-color: rgba(124, 77, 255, .58);
+      }
+
+      .primary:hover {
+        box-shadow: 0 8px 20px rgba(43, 4, 118, .34);
+      }
     }
 
     .empty {
@@ -3281,18 +3744,47 @@ function renderMainHtml({
     }
 
     @media (max-width: 980px) {
-      .topbar { grid-template-columns: 1fr; }
+      .hero-card { height: 200px; }
+      .resource-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .browse-tools {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+      .browse-tools .search-control { grid-column: 1 / -1; }
+      .browse-tools .view-toggle { grid-column: 1; }
+      .browse-tools .sort-control { grid-column: 2; }
+      .tab, .action, .primary, .secondary { min-height: 44px; }
       .dialog-shell { grid-template-columns: 1fr; }
       .dialog-preview { min-height: 46vh; border-right: 0; border-bottom: 1px solid var(--line); }
     }
 
     @media (max-width: 640px) {
-      .shell { width: min(100vw - 16px, 1180px); padding-top: 8px; }
-      .topbar { gap: 8px; margin-bottom: 10px; }
-      .hero-card, .hero-card img { min-height: 96px; height: 96px; }
-      .stat { position: absolute; right: 16px; top: 16px; min-width: 0; padding: 8px 10px; }
-      .stat strong { font-size: 1.25rem; }
-      .controls { padding: 10px; gap: 10px; }
+      .shell {
+        width: min(100vw - 16px, 1180px);
+        padding: max(8px, env(safe-area-inset-top)) 0 max(24px, env(safe-area-inset-bottom));
+      }
+      .topbar { margin-bottom: 10px; }
+      .hero-card { height: 150px; }
+      .controls { padding: 8px; gap: 8px; }
+      .library-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+      .library-title { grid-column: 1; grid-row: 1; }
+      .library-head .tabs {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        width: 100%;
+        margin: 0;
+        padding: 0 0 2px;
+        scroll-padding-inline: 0;
+      }
+      .library-actions { grid-column: 2; grid-row: 1; }
+      .browse-tools {
+        grid-template-columns: 1fr auto;
+        gap: 8px;
+      }
+      .browse-tools .search-control { grid-column: 1 / -1; grid-row: 1; }
+      .browse-tools .view-toggle { grid-column: 1; grid-row: 2; }
+      .browse-tools .sort-control { grid-column: 2; grid-row: 2; }
+      .browse-tools .sort-control span { position: absolute; width: 1px; height: 1px; overflow: hidden; }
+      .browse-tools select { min-height: 44px; }
       .tab, .action { min-height: 44px; }
       .resource-grid { padding: 10px; grid-template-columns: 1fr; }
       .resource-grid.list-view { padding: 4px 8px 10px; }
@@ -3314,8 +3806,12 @@ function renderMainHtml({
 
       .resource-grid.list-view .card {
         grid-template-columns: minmax(110px, 1fr) auto;
-        gap: 8px;
+        gap: 2px 8px;
+        min-height: 46px;
+        padding: 4px 6px;
+        align-items: center;
       }
+      .resource-grid.list-view .card h3 { line-height: 1.15; }
       .resource-grid.list-view .meta { grid-column: 1; }
       .resource-grid.list-view .actions {
         grid-column: 2;
@@ -3324,19 +3820,37 @@ function renderMainHtml({
       .resource-grid.list-view .actions .action:not(:first-child) {
         display: none;
       }
+      .resource-grid.list-view .action { min-height: 36px; padding: 5px 10px; }
+      .user-row { grid-template-columns: 1fr; }
+      .user-actions { justify-content: start; }
+
+      body[data-authenticated="0"] #actionsDialog {
+        width: calc(100vw - 16px);
+        max-height: calc(100dvh - 16px - env(safe-area-inset-bottom));
+        margin: auto 8px max(8px, env(safe-area-inset-bottom));
+        border-radius: 14px 14px 10px 10px;
+      }
+
+      body[data-authenticated="0"] #actionsDialog .upload-panel {
+        padding: 16px;
+      }
+
+      body[data-authenticated="0"] #actionsDialog .upload-logo {
+        width: 48px;
+        height: 48px;
+      }
+
+      body[data-authenticated="0"] #loginForm .primary {
+        width: 100%;
+      }
     }
   </style>
 </head>
-<body data-authenticated="${authenticated ? "1" : "0"}">
+<body data-authenticated="${authenticated ? "1" : "0"}" data-approved="${approved ? "1" : "0"}" data-role="${escapeHtmlText(role)}">
   <main class="shell">
     <header class="topbar">
       <div class="hero-card">
         <img src="/assets/banner.png" alt="" aria-hidden="true">
-        
-      </div>
-      <div class="stat">
-        <strong id="totalCount">0</strong>
-        <span>sheets</span>
       </div>
     </header>
 
@@ -3344,6 +3858,10 @@ function renderMainHtml({
       <section class="panel library">
         <div class="controls">
           <div class="library-head">
+            <div class="library-title">
+              <h1>Sheet library</h1>
+              <span class="sheet-count"><strong id="totalCount">0</strong> sheets</span>
+            </div>
             <div class="tabs" id="tabs" aria-label="Sheet type filter">
               <button class="tab active" data-tab="all" type="button">All</button>
               <button class="tab" data-tab="pdf" type="button">PDFs</button>
@@ -3352,18 +3870,33 @@ function renderMainHtml({
               <button class="tab" data-tab="other" type="button">Other</button>
             </div>
             <div class="library-actions">
-              <button class="primary auth-only" id="addSheetButton" type="button">Add sheet</button>
-              <button class="secondary" id="accountButton" type="button">Account</button>
+              <button class="primary auth-only requires-approved" id="addSheetButton" type="button">Add sheet</button>
+              <button class="secondary" id="accountButton" type="button"
+                onclick="document.querySelector('#actionsDialog').showModal()">${
+                  authenticated ? "Account" : "Sign in"
+                }</button>
             </div>
           </div>
-          <div class="view-toggle" id="viewToggle" aria-label="Library view toggle">
-            <button class="tab active" data-view="grid" type="button">Grid</button>
-            <button class="tab" data-view="list" type="button">List</button>
+          <div class="browse-tools">
+            <div class="view-toggle" id="viewToggle" aria-label="Library view toggle">
+              <button class="tab active" data-view="grid" type="button">Grid</button>
+              <button class="tab" data-view="list" type="button">List</button>
+              <button class="tab auth-only" id="myUploadsButton" type="button">My uploads</button>
+            </div>
+            <label class="search-control">
+              Search sheets
+              <input id="searchInput" type="search" placeholder="Title, artist, tags, key, notes, or text">
+            </label>
+            <label class="sort-control">
+              <span>Sort by</span>
+              <select id="sortSelect">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="title-asc">Title A–Z</option>
+                <option value="title-desc">Title Z–A</option>
+              </select>
+            </label>
           </div>
-          <label>
-            Search sheets
-            <input id="searchInput" type="search" placeholder="Title, artist, tags, key, notes, or text">
-          </label>
         </div>
         <div class="resource-grid" id="resourceGrid" aria-live="polite" aria-busy="true"></div>
       </section>
@@ -3374,22 +3907,21 @@ function renderMainHtml({
         <div class="panel-title">
           <img class="upload-logo" src="/assets/logo.png" alt="">
           <div>
-            <h2 id="actionsTitle">Library actions</h2>
-            <p class="panel-subtitle">Upload, login, and thumbnail maintenance live here.</p>
+            <h2 id="actionsTitle">${authenticated ? "Library actions" : "Sign in"}</h2>
+            <p class="panel-subtitle" id="actionsSubtitle">Upload, account, and thumbnail maintenance live here.</p>
           </div>
           <span class="pill" id="authBadge">${authenticated ? `Signed in as ${escapeHtmlText(username || "account")}` : "Signed out"}</span>
           <button class="close" id="closeActions" type="button" aria-label="Close library actions">✕</button>
         </div>
 
         <div class="tabs" id="sideTabs">
-          <button class="tab active" data-side-tab="add" type="button">Add sheet</button>
-          <button class="tab" data-side-tab="admin" type="button">Admin</button>
+          <button class="tab ${authenticated ? "active" : ""}" data-side-tab="add" type="button">Add sheet</button>
+          <button class="tab ${authenticated ? "" : "active"}" data-side-tab="admin" type="button">Account</button>
         </div>
 
         <div class="tab-panels">
-          <section class="tab-panel active" data-side-panel="add">
-            <p class="panel-subtitle">Use this tab on smaller screens when you do not want the upload form to share space with the library.</p>
-            <form id="uploadForm" class="requires-auth">
+          <section class="tab-panel ${authenticated ? "active" : ""}" data-side-panel="add">
+            <form id="uploadForm" class="requires-approved">
               <label>
                 Title
                 <input id="titleInput" name="title" maxlength="120" required placeholder="Example: Holy Holy Holy">
@@ -3450,24 +3982,42 @@ function renderMainHtml({
             </div>
           </section>
 
-          <section class="tab-panel" data-side-panel="admin">
+          <section class="tab-panel ${authenticated ? "" : "active"}" data-side-panel="admin">
             <div class="admin-stack guest-only">
-              <div class="admin-meta">
-                <strong>Sign in</strong>
-                <span>Sign in to browse and upload. Maintenance tools remain administrator-only.</span>
+              <div class="admin-stack" id="signInView">
+                <p class="signin-intro">Sign in to browse and upload.</p>
+                <form id="loginForm">
+                  <label>Username
+                    <input id="loginUserInput" name="username" autocomplete="username" required>
+                  </label>
+                  <label>Password
+                    <input id="loginPasswordInput" name="password" type="password" autocomplete="current-password" required>
+                  </label>
+                  <button class="primary" id="loginButton" type="submit">Sign in</button>
+                  <div class="message" id="loginMessage" role="status" aria-live="polite"></div>
+                </form>
+                <button class="secondary" id="showRegisterButton" type="button">Create an account</button>
               </div>
-              <form id="loginForm">
-                <label>
-                  Username
-                  <input id="loginUserInput" name="username" autocomplete="username" required>
-                </label>
-                <label>
-                  Password
-                  <input id="loginPasswordInput" name="password" type="password" autocomplete="current-password" required>
-                </label>
-                <button class="primary" id="loginButton" type="submit">Sign in</button>
-                <div class="message" id="loginMessage" role="status" aria-live="polite"></div>
-              </form>
+              <div class="admin-stack" id="registerView" hidden>
+                <div class="admin-meta">
+                  <strong>Create an account</strong>
+                  <span>Registration provides guest-library access until an administrator approves membership.</span>
+                </div>
+                <form id="registerForm">
+                  <label>Username
+                    <input id="registerLogin" maxlength="128" autocomplete="username" required>
+                  </label>
+                  <label>Display name
+                    <input id="registerDisplayName" maxlength="120" required>
+                  </label>
+                  <label>Password
+                    <input id="registerPassword" type="password" autocomplete="new-password" required>
+                  </label>
+                  <button class="primary" id="registerButton" type="submit">Create account</button>
+                  <div class="message" id="registerMessage" role="status" aria-live="polite"></div>
+                </form>
+                <button class="secondary" id="showSignInButton" type="button">Back to sign in</button>
+              </div>
             </div>
 
             <div class="admin-stack auth-only">
@@ -3475,9 +4025,52 @@ function renderMainHtml({
                 <strong id="adminUserLabel">Admin</strong>
                 <span id="adminSessionLabel">Signed in.</span>
               </div>
+              <div class="admin-meta" id="pendingApprovalNotice" ${approved || role === "admin" ? "hidden" : ""}>
+                <strong>Awaiting administrator approval</strong>
+                <span>You can use the guest library and manage your account. Uploads and annotations unlock after approval.</span>
+              </div>
+              <form id="profileForm">
+                <label>Display name
+                  <input id="profileDisplayName" maxlength="120" required>
+                </label>
+                <label>Current password
+                  <input id="profileCurrentPassword" type="password" autocomplete="current-password" required>
+                </label>
+                <button class="secondary" id="profileSaveButton" type="submit">Save profile</button>
+                <div class="message" id="profileMessage" role="status" aria-live="polite"></div>
+              </form>
               <div class="admin-actions admin-only">
                 <button class="secondary" id="refreshThumbsButton" type="button">Refresh thumbnails</button>
+                <a class="secondary backup-link" href="/api/admin/uploads-backup.zip">Back up uploaded files</a>
               </div>
+              <section class="user-management admin-only" id="userManagement">
+                <h3>Accounts</h3>
+                <form id="createUserForm">
+                  <div class="grid-2">
+                    <label>Username
+                      <input id="newUserLogin" maxlength="128" autocomplete="off" required>
+                    </label>
+                    <label>Display name
+                      <input id="newUserDisplayName" maxlength="120" autocomplete="off" required>
+                    </label>
+                  </div>
+                  <div class="grid-2">
+                    <label>Temporary password
+                      <input id="newUserPassword" type="password" autocomplete="new-password" required>
+                    </label>
+                    <label>Role
+                      <select id="newUserRole">
+                        <option value="member">Member</option>
+                        <option value="admin">Administrator</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label><span><input id="newUserMustChange" type="checkbox" checked> Require password change at first login</span></label>
+                  <button class="primary" id="createUserButton" type="submit">Create account</button>
+                </form>
+                <div class="message" id="userMessage" role="status" aria-live="polite"></div>
+                <div class="user-list" id="userList"></div>
+              </section>
               <button class="secondary danger" id="logoutButton" type="button">Sign out</button>
               <div class="message" id="adminMessage" role="status" aria-live="polite"></div>
             </div>
@@ -3534,13 +4127,14 @@ function renderMainHtml({
             </label>
             <button class="primary" id="detailSaveButton" type="submit">Save changes</button>
             <button class="secondary danger admin-only" id="detailDeleteButton" type="button">Delete sheet</button>
+            <button class="secondary admin-only" id="detailVisibilityButton" type="button">Publish to guest library</button>
             <div class="message" id="detailMessage" role="status" aria-live="polite"></div>
           </form>
         </section>
 
         <section class="section">
           <h3>Page-based annotations</h3>
-          <form id="annotationForm">
+          <form id="annotationForm" class="requires-approved">
             <div class="grid-2">
               <label>
                 Page
@@ -3590,6 +4184,32 @@ function renderMainHtml({
     </aside>
   </dialog>
 
+  <dialog class="actions-dialog" id="accountActionDialog" aria-labelledby="accountActionTitle">
+    <aside class="panel upload-panel">
+      <h2 id="accountActionTitle">Update account</h2>
+      <p id="accountActionHelp" class="panel-subtitle"></p>
+      <form id="accountActionForm">
+        <div id="accountIdentityFields">
+          <label>Username
+            <input id="accountEditLogin" maxlength="128">
+          </label>
+          <label>Display name
+            <input id="accountEditDisplayName" maxlength="120">
+          </label>
+        </div>
+        <div id="accountPasswordFields">
+          <label>Temporary password
+            <input id="accountResetPassword" type="password" autocomplete="new-password">
+          </label>
+          <p class="hint">The user will be required to change this password at next login.</p>
+        </div>
+        <div class="message" id="accountActionMessage" role="status" aria-live="polite"></div>
+        <button class="primary" id="accountActionConfirm" type="submit">Confirm</button>
+        <button class="secondary" id="accountActionCancel" type="button">Cancel</button>
+      </form>
+    </aside>
+  </dialog>
+
   <button class="metro-fab" id="metroFab" type="button" aria-controls="metroPanel" aria-expanded="false">Metronome</button>
 
   <aside class="metro" id="metroPanel" aria-label="Visual metronome">
@@ -3615,6 +4235,8 @@ function renderMainHtml({
       total: 0,
       activeTab: "all",
       viewMode: "grid",
+      sort: "newest",
+      mineOnly: false,
       query: "",
       catalogStatus: "loading",
       catalogMessage: "",
@@ -3625,8 +4247,10 @@ function renderMainHtml({
       authenticated,
       csrfToken,
       username: username || "",
+      displayName: displayName || "",
       userId: userId || "",
       role: role || "",
+      approved: Boolean(approved),
       mustChangePassword: Boolean(mustChangePassword)
     })};
 
@@ -3670,11 +4294,22 @@ function renderMainHtml({
     const uploadButton = document.querySelector("#uploadButton");
     const sideTabs = document.querySelector("#sideTabs");
     const authBadge = document.querySelector("#authBadge");
+    const actionsTitle = document.querySelector("#actionsTitle");
     const loginForm = document.querySelector("#loginForm");
     const loginUserInput = document.querySelector("#loginUserInput");
     const loginPasswordInput = document.querySelector("#loginPasswordInput");
     const loginButton = document.querySelector("#loginButton");
     const loginMessage = document.querySelector("#loginMessage");
+    const registerForm = document.querySelector("#registerForm");
+    const registerLogin = document.querySelector("#registerLogin");
+    const registerDisplayName = document.querySelector("#registerDisplayName");
+    const registerPassword = document.querySelector("#registerPassword");
+    const registerButton = document.querySelector("#registerButton");
+    const registerMessage = document.querySelector("#registerMessage");
+    const signInView = document.querySelector("#signInView");
+    const registerView = document.querySelector("#registerView");
+    const showRegisterButton = document.querySelector("#showRegisterButton");
+    const showSignInButton = document.querySelector("#showSignInButton");
     const adminUserLabel = document.querySelector("#adminUserLabel");
     const adminSessionLabel = document.querySelector("#adminSessionLabel");
     const refreshThumbsButton = document.querySelector("#refreshThumbsButton");
@@ -3682,9 +4317,37 @@ function renderMainHtml({
     const adminMessage = document.querySelector("#adminMessage");
     const resourceGrid = document.querySelector("#resourceGrid");
     const searchInput = document.querySelector("#searchInput");
+    const sortSelect = document.querySelector("#sortSelect");
     const totalCount = document.querySelector("#totalCount");
     const tabs = document.querySelector("#tabs");
     const viewToggle = document.querySelector("#viewToggle");
+    const myUploadsButton = document.querySelector("#myUploadsButton");
+    const profileForm = document.querySelector("#profileForm");
+    const profileDisplayName = document.querySelector("#profileDisplayName");
+    const profileCurrentPassword = document.querySelector("#profileCurrentPassword");
+    const profileSaveButton = document.querySelector("#profileSaveButton");
+    const profileMessage = document.querySelector("#profileMessage");
+    const createUserForm = document.querySelector("#createUserForm");
+    const newUserLogin = document.querySelector("#newUserLogin");
+    const newUserDisplayName = document.querySelector("#newUserDisplayName");
+    const newUserPassword = document.querySelector("#newUserPassword");
+    const newUserRole = document.querySelector("#newUserRole");
+    const newUserMustChange = document.querySelector("#newUserMustChange");
+    const createUserButton = document.querySelector("#createUserButton");
+    const userMessage = document.querySelector("#userMessage");
+    const userList = document.querySelector("#userList");
+    const accountActionDialog = document.querySelector("#accountActionDialog");
+    const accountActionTitle = document.querySelector("#accountActionTitle");
+    const accountActionHelp = document.querySelector("#accountActionHelp");
+    const accountActionForm = document.querySelector("#accountActionForm");
+    const accountIdentityFields = document.querySelector("#accountIdentityFields");
+    const accountPasswordFields = document.querySelector("#accountPasswordFields");
+    const accountEditLogin = document.querySelector("#accountEditLogin");
+    const accountEditDisplayName = document.querySelector("#accountEditDisplayName");
+    const accountResetPassword = document.querySelector("#accountResetPassword");
+    const accountActionMessage = document.querySelector("#accountActionMessage");
+    const accountActionConfirm = document.querySelector("#accountActionConfirm");
+    const accountActionCancel = document.querySelector("#accountActionCancel");
     const metroFab = document.querySelector("#metroFab");
     const sheetDialog = document.querySelector("#sheetDialog");
     const detailPreview = document.querySelector("#detailPreview");
@@ -3700,6 +4363,7 @@ function renderMainHtml({
     const detailNotesInput = document.querySelector("#detailNotesInput");
     const detailMessage = document.querySelector("#detailMessage");
     const detailDeleteButton = document.querySelector("#detailDeleteButton");
+    const detailVisibilityButton = document.querySelector("#detailVisibilityButton");
     const closeDialog = document.querySelector("#closeDialog");
     const annotationForm = document.querySelector("#annotationForm");
     const annotationPageInput = document.querySelector("#annotationPageInput");
@@ -3722,6 +4386,7 @@ function renderMainHtml({
 
     let activeDetailId = "";
     let catalogRequest = 0;
+    let pendingAccountAction = null;
 
     function setMessage(text, kind = "") {
       message.textContent = text;
@@ -3783,20 +4448,32 @@ function renderMainHtml({
       authState.csrfToken = nextState && nextState.csrfToken ? String(nextState.csrfToken) : "";
       authState.username = nextState && (nextState.user || nextState.username)
         ? String(nextState.user || nextState.username) : "";
+      authState.displayName = nextState && nextState.displayName
+        ? String(nextState.displayName) : authState.displayName || "";
       authState.userId = nextState && nextState.userId ? String(nextState.userId) : "";
       authState.role = nextState && nextState.role ? String(nextState.role) : "";
+      authState.approved = Boolean(nextState && nextState.approved);
       authState.mustChangePassword = Boolean(nextState && nextState.mustChangePassword);
       document.body.dataset.authenticated = authState.authenticated ? "1" : "0";
       document.body.dataset.role = authState.role;
+      document.body.dataset.approved = authState.approved ? "1" : "0";
       authBadge.textContent = authState.authenticated
         ? "Signed in as " + (authState.username || "admin")
         : "Signed out";
+      actionsTitle.textContent = authState.authenticated ? "Library actions" : "Sign in";
+      accountButton.textContent = authState.authenticated
+        ? "Account"
+        : "Sign in";
       adminUserLabel.textContent = authState.authenticated
         ? (authState.username || "admin")
         : "Admin";
       adminSessionLabel.textContent = authState.authenticated
-        ? "Session active."
+        ? (authState.role === "admin" || authState.approved
+          ? "Approved account." : "Awaiting administrator approval.")
         : "Signed out.";
+      document.querySelector("#pendingApprovalNotice").hidden =
+        !authState.authenticated || authState.role === "admin" || authState.approved;
+      profileDisplayName.value = authState.displayName;
       if (authState.authenticated) {
         loginForm.reset();
         loginMessage.textContent = "";
@@ -3858,7 +4535,9 @@ function renderMainHtml({
     function getQueryParams() {
       return new URLSearchParams({
         kind: state.activeTab,
-        q: state.query
+        q: state.query,
+        sort: state.sort,
+        mine: state.mineOnly ? "1" : ""
       });
     }
 
@@ -3869,10 +4548,16 @@ function renderMainHtml({
       if (state.query) url.searchParams.set("q", state.query);
       else url.searchParams.delete("q");
       url.searchParams.set("view", state.viewMode);
+      if (state.sort === "newest") url.searchParams.delete("sort");
+      else url.searchParams.set("sort", state.sort);
+      if (state.mineOnly) url.searchParams.set("mine", "1");
+      else url.searchParams.delete("mine");
       history[push ? "pushState" : "replaceState"]({
         kind: state.activeTab,
         q: state.query,
         view: state.viewMode,
+        sort: state.sort,
+        mine: state.mineOnly,
         scrollY: window.scrollY
       }, "", url);
       sessionStorage.setItem("mafusheets.scrollY", String(window.scrollY));
@@ -3932,7 +4617,7 @@ function renderMainHtml({
         return;
       }
       if (!state.resources.length) {
-        const filtered = Boolean(state.query || state.activeTab !== "all");
+        const filtered = Boolean(state.query || state.activeTab !== "all" || state.mineOnly);
         resourceGrid.innerHTML = '<div class="library-state">' +
           (filtered ? "No sheets match these filters." : "The library is empty.") + '</div>';
         return;
@@ -4015,7 +4700,12 @@ function renderMainHtml({
       state.selectedResourceId = resource.id;
 
       detailTitle.textContent = resource.title || 'Sheet';
-      detailSubtitle.textContent = [resource.artist, kindLabels[resource.sheetKind] || 'Other', resource.originalName].filter(Boolean).join(' · ');
+      detailSubtitle.textContent = [
+        resource.artist,
+        kindLabels[resource.sheetKind] || 'Other',
+        resource.originalName,
+        resource.uploadedByDisplayName ? "Uploaded by " + resource.uploadedByDisplayName : ""
+      ].filter(Boolean).join(' · ');
       detailTitleInput.value = resource.title || '';
       detailArtistInput.value = resource.artist || '';
       detailKeyInput.value = resource.key || '';
@@ -4031,6 +4721,9 @@ function renderMainHtml({
         if (control !== detailDeleteButton) control.disabled = !canEdit;
       });
       detailDeleteButton.hidden = authState.role !== "admin";
+      detailVisibilityButton.hidden = authState.role !== "admin";
+      detailVisibilityButton.textContent = resource.visibility === "guest"
+        ? "Remove from guest library" : "Publish to guest library";
 
       if (resource.canPreview) {
         if (resource.sheetKind === 'image') {
@@ -4176,6 +4869,37 @@ function renderMainHtml({
       }
     }
 
+    async function changeResourceVisibility() {
+      const resource = state.selectedResource;
+      if (!resource || authState.role !== "admin") return;
+
+      const visibility = resource.visibility === "guest" ? "restricted" : "guest";
+      detailVisibilityButton.disabled = true;
+      try {
+        const response = await apiFetch(
+          "/api/admin/resources/" + encodeURIComponent(resource.id) + "/visibility",
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ visibility: visibility })
+          }
+        );
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not change visibility.");
+
+        resource.visibility = result.visibility;
+        detailVisibilityButton.textContent = result.visibility === "guest"
+          ? "Remove from guest library" : "Publish to guest library";
+        setDetailMessage(result.visibility === "guest"
+          ? "Published to the guest library." : "Restricted to approved members.", "ok");
+        await loadResources();
+      } catch (error) {
+        setDetailMessage(error.message, "error");
+      } finally {
+        detailVisibilityButton.disabled = false;
+      }
+    }
+
     async function login(event) {
       event.preventDefault();
       loginMessage.textContent = "Signing in...";
@@ -4202,6 +4926,7 @@ function renderMainHtml({
           authenticated: true,
           csrfToken: result.csrfToken,
           user: result.user,
+          displayName: result.displayName,
           userId: result.userId,
           role: result.role,
           mustChangePassword: result.mustChangePassword
@@ -4250,6 +4975,36 @@ function renderMainHtml({
       } catch (error) {
         adminMessage.textContent = error.message;
         adminMessage.className = "message error";
+      }
+    }
+
+    async function registerAccount(event) {
+      event.preventDefault();
+      registerButton.disabled = true;
+      registerMessage.textContent = "Creating account…";
+      registerMessage.className = "message";
+      try {
+        const response = await fetch("/api/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            loginIdentifier: registerLogin.value,
+            displayName: registerDisplayName.value,
+            password: registerPassword.value
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not create account.");
+        setAuthUi({ authenticated: true, ...result });
+        registerForm.reset();
+        registerMessage.textContent = "Account created. Approval is pending.";
+        registerMessage.className = "message ok";
+        await loadResources();
+      } catch (error) {
+        registerMessage.textContent = error.message;
+        registerMessage.className = "message error";
+      } finally {
+        registerButton.disabled = false;
       }
     }
 
@@ -4320,6 +5075,213 @@ function renderMainHtml({
         adminMessage.className = "message error";
       } finally {
         refreshThumbsButton.disabled = false;
+      }
+    }
+
+    function renderUsers(users) {
+      if (!users.length) {
+        userList.innerHTML = '<div class="hint">No accounts found.</div>';
+        return;
+      }
+      userList.innerHTML = users.map(function(user) {
+        const status = !user.enabled ? "Suspended" : user.approved ? "Approved" : "Pending approval";
+        const lastLogin = user.lastLoginAt ? "Last login " + formatDate(user.lastLoginAt) : "Never signed in";
+        const isSelf = user.id === authState.userId;
+        return '<div class="user-row" data-user-id="' + escapeHtml(user.id) + '">' +
+          '<span hidden data-user-login>' + escapeHtml(user.loginIdentifier) + '</span>' +
+          '<span hidden data-user-display-name>' + escapeHtml(user.displayName) + '</span>' +
+          '<div><strong>' + escapeHtml(user.displayName) + '</strong><div>' +
+          escapeHtml(user.loginIdentifier) + '</div><p class="hint">' +
+          escapeHtml(user.role === "admin" ? "Administrator" : "Member") + " · " +
+          status + " · " + escapeHtml(lastLogin) +
+          (user.mustChangePassword ? " · Password change required" : "") + '</p></div>' +
+          '<div class="user-actions">' +
+          '<button class="secondary" type="button" data-user-action="edit">Edit</button>' +
+          (isSelf ? '<span class="hint">Current account</span>' :
+          '<button class="secondary" type="button" data-user-action="role" data-role="' +
+          escapeHtml(user.role) + '">' + (user.role === "admin" ? "Make member" : "Make admin") + '</button>' +
+          (user.role === "admin" ? "" :
+          '<button class="secondary" type="button" data-user-action="approval" data-approved="' +
+          String(user.approved) + '">' + (user.approved ? "Revoke approval" : "Approve") + '</button>') +
+          '<button class="secondary" type="button" data-user-action="toggle" data-enabled="' +
+          String(user.enabled) + '">' + (user.enabled ? "Disable" : "Enable") + '</button>' +
+          '<button class="secondary" type="button" data-user-action="reset">Reset password</button>') +
+          '</div></div>';
+      }).join("");
+    }
+
+    async function loadUsers() {
+      if (authState.role !== "admin") return;
+      userMessage.textContent = "Loading accounts…";
+      userMessage.className = "message";
+      const response = await apiFetch("/api/admin/users");
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Could not load accounts.");
+      renderUsers(Array.isArray(result.users) ? result.users : []);
+      userMessage.textContent = "";
+    }
+
+    async function createUser(event) {
+      event.preventDefault();
+      createUserButton.disabled = true;
+      userMessage.textContent = "Creating account…";
+      userMessage.className = "message";
+      try {
+        const response = await apiFetch("/api/admin/users", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            loginIdentifier: newUserLogin.value,
+            displayName: newUserDisplayName.value,
+            password: newUserPassword.value,
+            role: newUserRole.value,
+            mustChangePassword: newUserMustChange.checked
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not create account.");
+        createUserForm.reset();
+        newUserRole.value = "member";
+        newUserMustChange.checked = true;
+        userMessage.textContent = "Account created.";
+        userMessage.className = "message ok";
+        await loadUsers();
+      } catch (error) {
+        userMessage.textContent = error.message;
+        userMessage.className = "message error";
+      } finally {
+        createUserButton.disabled = false;
+      }
+    }
+
+    function openAccountAction(button) {
+      const row = button.closest("[data-user-id]");
+      if (!row) return;
+      const action = button.dataset.userAction;
+      pendingAccountAction = {
+        id: row.dataset.userId,
+        action: action,
+        role: button.dataset.role,
+        enabled: button.dataset.enabled,
+        approved: button.dataset.approved
+      };
+      accountActionForm.reset();
+      accountActionMessage.textContent = "";
+      accountIdentityFields.hidden = action !== "edit";
+      accountPasswordFields.hidden = action !== "reset";
+      if (action === "edit") {
+        accountActionTitle.textContent = "Edit account";
+        accountActionHelp.textContent = "Update the login identifier or display name.";
+        accountEditLogin.value = row.querySelector("[data-user-login]").textContent;
+        accountEditDisplayName.value = row.querySelector("[data-user-display-name]").textContent;
+        accountActionConfirm.textContent = "Save account";
+      } else if (action === "reset") {
+        accountActionTitle.textContent = "Reset password";
+        accountActionHelp.textContent = "Set a temporary password and revoke the user’s active sessions.";
+        accountActionConfirm.textContent = "Reset password";
+      } else if (action === "role") {
+        accountActionTitle.textContent = button.dataset.role === "admin"
+          ? "Make this user a member?" : "Make this user an administrator?";
+        accountActionHelp.textContent = "This changes the account’s permissions and revokes active sessions.";
+        accountActionConfirm.textContent = "Confirm role change";
+      } else if (action === "approval") {
+        accountActionTitle.textContent = button.dataset.approved === "true"
+          ? "Revoke this member’s approval?" : "Approve this member?";
+        accountActionHelp.textContent = button.dataset.approved === "true"
+          ? "The member will be signed out and limited to the guest library."
+          : "The member will be able to access restricted documents, upload, and annotate.";
+        accountActionConfirm.textContent = button.dataset.approved === "true"
+          ? "Revoke approval" : "Approve member";
+      } else {
+        accountActionTitle.textContent = button.dataset.enabled === "true"
+          ? "Disable this account?" : "Enable this account?";
+        accountActionHelp.textContent = button.dataset.enabled === "true"
+          ? "The user will be signed out and unable to log in."
+          : "The user will be allowed to log in again.";
+        accountActionConfirm.textContent = button.dataset.enabled === "true" ? "Disable account" : "Enable account";
+      }
+      accountActionDialog.showModal();
+    }
+
+    async function submitAccountAction(event) {
+      event.preventDefault();
+      if (!pendingAccountAction) return;
+      const action = pendingAccountAction.action;
+      let url = "/api/admin/users/" + encodeURIComponent(pendingAccountAction.id);
+      let method = "PATCH";
+      let body;
+      if (action === "role") {
+        body = { role: pendingAccountAction.role === "admin" ? "member" : "admin" };
+      } else if (action === "approval") {
+        body = { approved: pendingAccountAction.approved !== "true" };
+      } else if (action === "toggle") {
+        body = { enabled: pendingAccountAction.enabled !== "true" };
+      } else if (action === "reset") {
+        url += "/reset-password";
+        method = "POST";
+        body = { password: accountResetPassword.value, mustChangePassword: true };
+      } else if (action === "edit") {
+        body = {
+          loginIdentifier: accountEditLogin.value,
+          displayName: accountEditDisplayName.value
+        };
+      } else {
+        return;
+      }
+      accountActionConfirm.disabled = true;
+      accountActionMessage.textContent = "Updating account…";
+      try {
+        const response = await apiFetch(url, {
+          method: method,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not update account.");
+        userMessage.textContent = action === "reset" ? "Temporary password set." : "Account updated.";
+        userMessage.className = "message ok";
+        if (pendingAccountAction.id === authState.userId && action === "edit") {
+          authState.username = result.user.loginIdentifier;
+          authState.displayName = result.user.displayName;
+          setAuthUi(authState);
+        }
+        accountActionDialog.close();
+        pendingAccountAction = null;
+        await loadUsers();
+      } catch (error) {
+        accountActionMessage.textContent = error.message;
+        accountActionMessage.className = "message error";
+      } finally {
+        accountActionConfirm.disabled = false;
+      }
+    }
+
+    async function saveProfile(event) {
+      event.preventDefault();
+      profileSaveButton.disabled = true;
+      profileMessage.textContent = "Saving profile…";
+      profileMessage.className = "message";
+      try {
+        const response = await apiFetch("/api/account/profile", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            displayName: profileDisplayName.value,
+            currentPassword: profileCurrentPassword.value
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Could not save profile.");
+        authState.displayName = result.user.displayName;
+        profileCurrentPassword.value = "";
+        setAuthUi(authState);
+        profileMessage.textContent = "Profile saved.";
+        profileMessage.className = "message ok";
+      } catch (error) {
+        profileMessage.textContent = error.message;
+        profileMessage.className = "message error";
+      } finally {
+        profileSaveButton.disabled = false;
       }
     }
 
@@ -4409,6 +5371,20 @@ function renderMainHtml({
       debouncedLoadResources();
     });
 
+    sortSelect.addEventListener("change", function() {
+      state.sort = sortSelect.value;
+      localStorage.setItem("mafusheets.sort", state.sort);
+      persistBrowseState(true);
+      loadResources();
+    });
+
+    myUploadsButton.addEventListener("click", function() {
+      state.mineOnly = !state.mineOnly;
+      myUploadsButton.classList.toggle("active", state.mineOnly);
+      persistBrowseState(true);
+      loadResources();
+    });
+
     tabs.addEventListener('click', function(event) {
       const button = event.target.closest('[data-tab]');
       if (!button) return;
@@ -4478,6 +5454,7 @@ function renderMainHtml({
         setDetailMessage(error.message, 'error');
       });
     });
+    detailVisibilityButton.addEventListener("click", changeResourceVisibility);
 
     loginForm.addEventListener('submit', function(event) {
       login(event).catch(function(error) {
@@ -4491,6 +5468,34 @@ function renderMainHtml({
         adminMessage.textContent = error.message;
         adminMessage.className = "message error";
       });
+    });
+
+    createUserForm.addEventListener("submit", function(event) {
+      createUser(event);
+    });
+    registerForm.addEventListener("submit", registerAccount);
+    showRegisterButton.addEventListener("click", function() {
+      signInView.hidden = true;
+      registerView.hidden = false;
+      actionsTitle.textContent = "Create an account";
+      registerLogin.focus();
+    });
+    showSignInButton.addEventListener("click", function() {
+      registerView.hidden = true;
+      signInView.hidden = false;
+      actionsTitle.textContent = "Sign in";
+      loginUserInput.focus();
+    });
+    userList.addEventListener("click", function(event) {
+      const button = event.target.closest("[data-user-action]");
+      if (!button) return;
+      openAccountAction(button);
+    });
+    profileForm.addEventListener("submit", saveProfile);
+    accountActionForm.addEventListener("submit", submitAccountAction);
+    accountActionCancel.addEventListener("click", function() {
+      pendingAccountAction = null;
+      accountActionDialog.close();
     });
 
     logoutButton.addEventListener('click', function() {
@@ -4522,6 +5527,12 @@ function renderMainHtml({
     function openActions(tabName) {
       setSideTab(tabName);
       if (!actionsDialog.open) actionsDialog.showModal();
+      if (tabName === "admin" && authState.role === "admin") {
+        loadUsers().catch(function(error) {
+          userMessage.textContent = error.message;
+          userMessage.className = "message error";
+        });
+      }
       window.setTimeout(function() {
         const target = tabName === "add" ? titleInput : loginUserInput;
         if (target && target.offsetParent !== null) target.focus();
@@ -4637,7 +5648,12 @@ function renderMainHtml({
       state.activeTab = params.get("kind") || "all";
       state.query = params.get("q") || "";
       state.viewMode = params.get("view") === "list" ? "list" : "grid";
+      state.sort = ["oldest", "title-asc", "title-desc"].includes(params.get("sort"))
+        ? params.get("sort") : "newest";
+      state.mineOnly = params.get("mine") === "1";
       searchInput.value = state.query;
+      sortSelect.value = state.sort;
+      myUploadsButton.classList.toggle("active", state.mineOnly);
       tabs.querySelectorAll("[data-tab]").forEach(function(tab) {
         tab.classList.toggle("active", tab.dataset.tab === state.activeTab);
       });
@@ -4651,7 +5667,13 @@ function renderMainHtml({
     const initialParams = new URLSearchParams(window.location.search);
     state.activeTab = initialParams.get("kind") || "all";
     state.query = initialParams.get("q") || "";
+    state.mineOnly = initialParams.get("mine") === "1";
+    const initialSort = initialParams.get("sort") || localStorage.getItem("mafusheets.sort") || "newest";
+    state.sort = ["newest", "oldest", "title-asc", "title-desc"].includes(initialSort)
+      ? initialSort : "newest";
     searchInput.value = state.query;
+    sortSelect.value = state.sort;
+    myUploadsButton.classList.toggle("active", state.mineOnly);
     tabs.querySelectorAll("[data-tab]").forEach(function(tab) {
       tab.classList.toggle("active", tab.dataset.tab === state.activeTab);
     });

@@ -3,7 +3,9 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
+const BetterSqlite3 = require("better-sqlite3");
 const { openDatabase, CURRENT_SCHEMA_VERSION } = require("../lib/database");
 
 function argument(name) {
@@ -82,8 +84,15 @@ async function backup() {
   const databasePath = required("--database");
   const uploadsPath = required("--uploads");
   const output = safeDestination(required("--output"));
-  if (!argument("--release") || !argument("--image") || !argument("--config-id")) {
-    throw new Error("--release, --image, and --config-id are required non-secret identifiers.");
+  if (!argument("--application-commit") || !argument("--image-digest") ||
+      !argument("--bundle-id") || !argument("--config-id")) {
+    throw new Error("--application-commit, --image-digest, --bundle-id, and --config-id are required.");
+  }
+  if (!/^sha256:[a-f0-9]{64}$/.test(argument("--image-digest"))) {
+    throw new Error("--image-digest must be an immutable sha256 digest.");
+  }
+  if (!/^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{24}$/.test(argument("--bundle-id"))) {
+    throw new Error("--bundle-id is invalid.");
   }
   await fsp.access(databasePath, fs.constants.R_OK);
   const uploadsStat = await fsp.lstat(uploadsPath);
@@ -106,11 +115,14 @@ async function backup() {
     ...(await inventory(output, "")).filter((item) => item.path !== "manifest.json")
   ];
   const manifest = {
-    format: "mafusheets-paired-backup-v1",
+    format: "mafusheets-backup",
+    formatVersion: 2,
+    verifierMinimumVersion: "1.0.0",
+    applicationCommit: argument("--application-commit"),
+    imageDigest: argument("--image-digest"),
     createdAt: new Date().toISOString(),
+    bundleId: argument("--bundle-id"),
     schemaVersion: CURRENT_SCHEMA_VERSION,
-    release: argument("--release"),
-    image: argument("--image"),
     configId: argument("--config-id"),
     consistency: "application-writes-quiesced",
     files
@@ -130,7 +142,8 @@ async function loadVerifiedManifest(source) {
     throw new Error("Backup source must be a real directory.");
   }
   const manifest = JSON.parse(await fsp.readFile(path.join(source, "manifest.json"), "utf8"));
-  if (manifest.format !== "mafusheets-paired-backup-v1" || !Array.isArray(manifest.files)) {
+  if (manifest.format !== "mafusheets-backup" || manifest.formatVersion !== 2 ||
+      !Array.isArray(manifest.files)) {
     throw new Error("Unsupported backup manifest.");
   }
   for (const item of manifest.files) {
@@ -146,6 +159,52 @@ async function loadVerifiedManifest(source) {
     }
   }
   return manifest;
+}
+
+async function verifyBackup() {
+  const source = safeDestination(required("--source"));
+  const manifest = await loadVerifiedManifest(source);
+  const snapshot = path.join(source, "database.sqlite");
+  const uploadsPath = path.join(source, "uploads");
+  const verificationDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), "mafusheets-verify-"));
+  const verificationDatabase = path.join(verificationDirectory, "database.sqlite");
+  await fsp.copyFile(snapshot, verificationDatabase, fs.constants.COPYFILE_EXCL);
+  const db = new BetterSqlite3(verificationDatabase, { readonly: true, fileMustExist: true });
+  let resourceCount;
+  let uploadCount;
+  try {
+    const integrity = db.pragma("integrity_check", { simple: true });
+    if (integrity !== "ok") throw new Error(`Backup SQLite integrity check failed: ${integrity}`);
+    const rows = db.prepare(`
+      SELECT r.id, f.category, f.stored_name FROM resources r
+      JOIN resource_files f ON f.resource_id=r.id AND f.ordinal=0
+      WHERE r.deleted_at IS NULL
+    `).all();
+    const missing = rows.filter((row) =>
+      !fs.existsSync(path.join(uploadsPath, row.category, row.stored_name))
+    ).map((row) => row.id);
+    if (missing.length) {
+      throw new Error(`Backup resources missing source files: ${missing.join(", ")}`);
+    }
+    resourceCount = rows.length;
+    uploadCount = (await regularFiles(uploadsPath)).length;
+  } finally {
+    db.close();
+    await fsp.rm(verificationDirectory, { recursive: true, force: true });
+  }
+  const result = {
+    ok: true,
+    action: "verify",
+    source,
+    schemaVersion: manifest.schemaVersion,
+    applicationCommit: manifest.applicationCommit,
+    imageDigest: manifest.imageDigest,
+    configId: manifest.configId,
+    resourceCount,
+    uploadCount
+  };
+  console.error(`Backup verified: ${source}`);
+  console.log(JSON.stringify(result));
 }
 
 async function assertEmptyDestination(databasePath, uploadsPath) {
@@ -190,8 +249,8 @@ async function restore() {
   }
   const result = {
     ok: true, action: "restore", database: databasePath, uploads: uploadsPath,
-    schemaVersion: manifest.schemaVersion, release: manifest.release,
-    image: manifest.image, configId: manifest.configId, missingResourceFiles: missing
+    schemaVersion: manifest.schemaVersion, applicationCommit: manifest.applicationCommit,
+    imageDigest: manifest.imageDigest, configId: manifest.configId, missingResourceFiles: missing
   };
   console.error(`Restore complete: ${databasePath} and ${uploadsPath}`);
   console.log(JSON.stringify(result));
@@ -221,12 +280,14 @@ async function rollback() {
 async function main() {
   const command = process.argv[2];
   if (command === "backup") return backup();
+  if (command === "verify") return verifyBackup();
   if (command === "restore") return restore();
   if (command === "rollback") return rollback();
-  throw new Error("Usage: release-data.js backup|restore|rollback [options]");
+  throw new Error("Usage: release-data.js backup|verify|restore|rollback [options]");
 }
 
+const keepAlive = setInterval(() => undefined, 1000);
 main().catch((error) => {
   console.error(JSON.stringify({ ok: false, error: error.message }));
   process.exitCode = 2;
-});
+}).finally(() => clearInterval(keepAlive));

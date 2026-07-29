@@ -19,7 +19,7 @@ test("mobile browsing is library-first and upload is an accessible on-demand dia
   assert.match(text, /id="addSheetButton"[^>]*>Add sheet</);
   assert.match(text, /actionsDialog\.showModal\(\)/);
   assert.match(text, /id="closeActions"[^>]*aria-label="Close library actions"/);
-  assert.match(text, /@media \(max-width: 640px\)[\s\S]*?min-height: 96px; height: 96px/);
+  assert.match(text, /@media \(max-width: 640px\)[\s\S]*?\.hero-card \{ height: 150px; \}/);
 });
 
 test("compact list mode creates no thumbnail or preview element", async () => {

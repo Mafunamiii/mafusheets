@@ -457,10 +457,21 @@ test("paired backup, clean restore, application operations, and rollback rehears
   });
   const backupResult = await runData([
     "backup", "--quiesced", "--database", value.databasePath, "--uploads", uploads,
-    "--output", backupSet, "--release", "8A-previous",
-    "--image", "mafusheets:previous", "--config-id", "config-previous"
+    "--output", backupSet,
+    "--application-commit", "0123456789abcdef0123456789abcdef01234567",
+    "--image-digest",
+    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "--bundle-id", "20260729T031500Z-0123456789abcdef01234567",
+    "--config-id", "config-previous"
   ]);
   assert.equal(backupResult.ok, true);
+  const verifyResult = await runData([
+    "verify", "--source", backupSet
+  ]);
+  assert.equal(verifyResult.ok, true);
+  assert.equal(verifyResult.action, "verify");
+  assert.equal(verifyResult.resourceCount, 1);
+  assert.equal(verifyResult.uploadCount, 1);
   await fsp.writeFile(stored, "destroyed after backup");
   const restoreResult = await runData([
     "restore", "--source", backupSet, "--database", restoredDb, "--uploads", restoredUploads

@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Verify and copy one root-owned archived MafuSheets backup."""
+
+import argparse
+import json
+from pathlib import Path
+import shutil
+import sys
+
+from mafusheets_backup import BackupError, verify_tree
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--destination", required=True, type=Path)
+    args = parser.parse_args()
+    try:
+        source = args.source.resolve(strict=True)
+        if not source.is_dir() or args.destination.exists():
+            raise BackupError("source must be an archive directory and destination must not exist")
+        args.destination.parent.resolve(strict=True)
+        manifest = verify_tree(source)
+        shutil.copytree(source, args.destination, symlinks=False)
+        print(json.dumps({"ok": True, "bundleId": manifest["bundleId"],
+                          "destination": str(args.destination)}))
+        print(f"Verified backup restored to {args.destination}", file=sys.stderr)
+        return 0
+    except (OSError, BackupError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}))
+        print(f"Restore failed: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

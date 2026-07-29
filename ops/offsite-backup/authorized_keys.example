@@ -1,0 +1,1 @@
+restrict,command="/usr/bin/rrsync -wo -no-del -no-overwrite -munge /var/spool/mafusheets-backup/incoming" ssh-ed25519 REPLACE_WITH_PRODUCTION_PUBLIC_KEY mafusheets-production-backup

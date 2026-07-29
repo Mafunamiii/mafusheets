@@ -13,6 +13,29 @@ const ROOT = path.join(__dirname, "..");
 const PORT = Number(process.env.BROWSER_TEST_PORT || 3218);
 const SECRET = "Batch8A-Browser-Test-Secret-Only-2026-xP4mT9vK";
 
+function twoPagePdf() {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "<< /Length 37 >>\nstream\nBT /F1 24 Tf 80 200 Td (Page 1) Tj ET\nendstream",
+    "<< /Length 37 >>\nstream\nBT /F1 24 Tf 80 200 Td (Page 2) Tj ET\nendstream"
+  ];
+  let output = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(output));
+    output += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(output);
+  output += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  output += offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  output += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(output);
+}
+
 async function main() {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "mafusheets-browser-"));
   const databasePath = path.join(directory, "app.sqlite");
@@ -58,6 +81,12 @@ async function main() {
       sheetKind: "image", originalName: "other.png", storedName: "other.png",
       extension: ".png", size: 20, uploadedAt: timestamp, uploadedBy: other.id,
       updatedBy: other.id, searchStatus: "ready", searchText: "other", annotations: []
+    },
+    {
+      id: "pdf-sheet", title: "Two page PDF", artist: "Test", category: "documents",
+      sheetKind: "pdf", originalName: "two-pages.pdf", storedName: "two-pages.pdf",
+      extension: ".pdf", size: twoPagePdf().length, uploadedAt: timestamp, uploadedBy: admin.id,
+      updatedBy: admin.id, searchStatus: "ready", searchText: "two page pdf", annotations: []
     }
   ], admin.id);
   db.close();
@@ -68,6 +97,8 @@ async function main() {
   for (const name of ["member.png", "other.png"]) {
     await fsp.writeFile(path.join(uploads, "photos", name), png);
   }
+  await fsp.mkdir(path.join(uploads, "documents"), { recursive: true });
+  await fsp.writeFile(path.join(uploads, "documents", "two-pages.pdf"), twoPagePdf());
   for (const id of ["member-sheet", "other-sheet"]) {
     await fsp.writeFile(path.join(thumbnails, `${id}.png`), png);
   }
@@ -85,7 +116,10 @@ async function main() {
       THUMB_DIR: thumbnails,
       TMP_DIR: path.join(directory, "temporary"),
       QUARANTINE_DIR: path.join(directory, "quarantine"),
-      SESSION_SECRET: SECRET
+      SESSION_SECRET: SECRET,
+      REQUIRE_HTTPS: "0",
+      COOKIE_SECURE: "0",
+      PUBLIC_ORIGIN: ""
     },
     stdio: "inherit"
   });

@@ -1,6 +1,7 @@
 "use strict";
 
 const { test, expect } = require("@playwright/test");
+const JSZip = require("jszip");
 
 async function login(page, username = "member@example.test", password = "MemberPassword2026") {
   await page.goto("/");
@@ -87,6 +88,36 @@ test("mobile viewport remains library-first", async ({ page }, testInfo) => {
   expect(library).not.toBeNull();
   expect(actions).toBeNull();
   await expect(page.getByText("Member sheet", { exact: true })).toBeVisible();
+});
+
+test("mobile PDF reader scrolls all pages and spaces actions", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium-mobile", "mobile project assertion");
+  await login(page);
+  await page.goto("/sheets/pdf-sheet");
+  await expect(page.getByRole("link", { name: "Open in new tab" })).toBeVisible();
+  await expect(page.locator(".pdf-page")).toHaveCount(2);
+  const open = await page.getByRole("link", { name: "Open in new tab" }).boundingBox();
+  const download = await page.getByRole("link", { name: "Download" }).boundingBox();
+  expect(open).not.toBeNull();
+  expect(download).not.toBeNull();
+  expect(download.y).toBe(open.y);
+  expect(download.x - (open.x + open.width)).toBeGreaterThanOrEqual(8);
+  await page.locator(".pdf-page").last().scrollIntoViewIfNeeded();
+  await expect(page.locator(".pdf-page").last()).toBeInViewport();
+});
+
+test("admin can download an uploaded-files backup", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium-desktop", "backup flow runs once");
+  await login(page, "admin@example.test", "AdminPassword2026");
+  const response = await page.request.get("/api/admin/uploads-backup.zip");
+  expect(response.ok()).toBe(true);
+  expect(response.headers()["content-type"]).toContain("application/zip");
+  const zip = await JSZip.loadAsync(await response.body());
+  expect(zip.file("backup-manifest.json")).not.toBeNull();
+  expect(zip.file("uploads/pdf-sheet/two-pages.pdf")).not.toBeNull();
+  const manifest = JSON.parse(await zip.file("backup-manifest.json").async("string"));
+  expect(manifest.format).toBe("mafusheets-upload-backup-v1");
+  expect(manifest.resources.some((resource) => resource.id === "pdf-sheet")).toBe(true);
 });
 
 test("compact list mode makes no thumbnail requests", async ({ page }) => {

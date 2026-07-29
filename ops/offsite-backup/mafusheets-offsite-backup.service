@@ -1,0 +1,17 @@
+[Unit]
+Description=Create and send a MafuSheets off-site backup
+Requires=docker.service tailscaled.service
+After=docker.service tailscaled.service network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+ExecStart=/home/deploy/mafusheets/scripts/offsite-backup-send.sh
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

@@ -52,7 +52,7 @@ test("clean database initialization enables schema and foreign keys", async (t) 
   const result = await migrateLegacyCatalog(db, catalogPath);
   assert.equal(result.status, "initialized-empty");
   assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 5);
+  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 6);
   assert.equal(createCatalogStore(db).listResources().length, 0);
 });
 
@@ -132,10 +132,59 @@ test("users retain roles and disabled users cannot authenticate", async (t) => {
   assert.equal(admin.role, "admin");
   assert.equal(member.role, "member");
   assert.equal(await users.authenticate("member@example.test", "MemberAccount2026").then(Boolean), true);
+  await assert.rejects(
+    users.updateOwnProfile(member.id, "Updated Member", "WrongPassword2026"),
+    /Current password/
+  );
+  const updatedMember = await users.updateOwnProfile(
+    member.id, "Updated Member", "MemberAccount2026"
+  );
+  assert.equal(updatedMember.displayName, "Updated Member");
+  const renamedMember = users.updateIdentity(member.id, {
+    loginIdentifier: "renamed@example.test",
+    displayName: "Renamed Member"
+  }, { actorUserId: admin.id, mode: "administrator" });
+  assert.equal(renamedMember.loginIdentifier, "renamed@example.test");
+  assert.equal(renamedMember.displayName, "Renamed Member");
+  assert.equal(await users.authenticate("renamed@example.test", "MemberAccount2026").then(Boolean), true);
   users.setEnabled(member.id, false, { actorUserId: admin.id, mode: "administrator" });
-  assert.equal(await users.authenticate("member@example.test", "MemberAccount2026"), null);
+  assert.equal(await users.authenticate("renamed@example.test", "MemberAccount2026"), null);
   const stored = db.prepare("SELECT password_hash FROM users WHERE id=?").get(admin.id);
   assert.notEqual(stored.password_hash, "DirectorAccount2026");
+});
+
+test("self-registered accounts remain pending until an administrator approves them", async (t) => {
+  const { db } = await fixture(t);
+  const users = createUserStore(db);
+  const admin = await users.createUser({
+    loginIdentifier: "admin@example.test",
+    displayName: "Administrator",
+    password: "Administrator2026",
+    role: "admin",
+    operator: EMERGENCY_OPERATOR
+  });
+  const pending = await users.register({
+    loginIdentifier: "pending@example.test",
+    displayName: "Pending Member",
+    password: "PendingMember2026"
+  });
+  assert.equal(pending.enabled, true);
+  assert.equal(pending.approved, false);
+  assert.equal((await users.authenticate(
+    "pending@example.test", "PendingMember2026"
+  )).approved, false);
+
+  const approved = users.setApproved(pending.id, true, {
+    actorUserId: admin.id,
+    mode: "administrator"
+  });
+  assert.equal(approved.approved, true);
+  assert.equal(approved.approvedBy, admin.id);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) count FROM audit_events WHERE event_type='approval_changed'")
+      .get().count,
+    1
+  );
 });
 
 test("resource ownership fields are enforced by foreign keys", async (t) => {

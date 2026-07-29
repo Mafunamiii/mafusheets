@@ -39,16 +39,27 @@ RSYNC_EXCLUDES=(
 
 case "${1:-}" in
   --pull)
-    rsync -avh --progress \
-      "${RSYNC_EXCLUDES[@]}" \
-      "${REMOTE_HOST}:${REMOTE_DIR}/" "${LOCAL_DIR}"
+    if [[ "${REMOTE_HOST}" == "local" ]]; then
+      echo "REMOTE_HOST=local: source and deployment directory are already the same."
+    else
+      rsync -avh --progress \
+        "${RSYNC_EXCLUDES[@]}" \
+        "${REMOTE_HOST}:${REMOTE_DIR}/" "${LOCAL_DIR}"
+    fi
     ;;
   --apply)
-    rsync -avh --progress \
-      "${RSYNC_EXCLUDES[@]}" \
-      "${LOCAL_DIR}" "${REMOTE_HOST}:${REMOTE_DIR}/"
-    ssh "${REMOTE_HOST}" \
-      "cd '${REMOTE_DIR}' && test \"\$(stat -c '%a' .env)\" = 600 && docker compose config --quiet && docker compose up -d --build --remove-orphans"
+    if [[ "${REMOTE_HOST}" == "local" ]]; then
+      cd "${REMOTE_DIR}"
+      test "$(stat -c '%a' .env)" = 600
+      docker compose config --quiet
+      docker compose up -d --build --remove-orphans
+    else
+      rsync -avh --progress \
+        "${RSYNC_EXCLUDES[@]}" \
+        "${LOCAL_DIR}" "${REMOTE_HOST}:${REMOTE_DIR}/"
+      ssh "${REMOTE_HOST}" \
+        "cd '${REMOTE_DIR}' && test \"\$(stat -c '%a' .env)\" = 600 && docker compose config --quiet && docker compose up -d --build --remove-orphans"
+    fi
     ;;
   --verify|"")
     exec "${SCRIPT_DIR}/scripts/verify-production.sh"

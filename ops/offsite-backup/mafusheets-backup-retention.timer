@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply MafuSheets archive retention
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=mafusheets-backup-retention.service
+
+[Install]
+WantedBy=timers.target

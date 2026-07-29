@@ -9,10 +9,12 @@
     "integrity": "node lib/integrity.js",
     "account": "node lib/bootstrap.js",
     "backup": "node scripts/release-data.js backup",
+    "verify-backup": "node scripts/release-data.js verify",
     "restore": "node scripts/release-data.js restore",
     "rollback": "node scripts/release-data.js rollback",
     "test": "node --test test/*.test.js",
     "test:batch8a": "node --test test/batch8a.test.js",
+    "test:offsite-backup": "node --test test/offsite-backup.test.js",
     "test:failure": "node --test --test-name-pattern='SQLite lock|ENOSPC|forced worker timeout|restart reports|concurrent resource|missing thumbnail binary' test/batch8a.test.js",
     "rehearse:backup": "node --test --test-name-pattern='paired backup' test/batch8a.test.js",
     "test:browser": "playwright test",
@@ -34,6 +36,7 @@
     "mammoth": "^1.8.0",
     "multer": "^2.0.2",
     "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^5.4.394",
     "sharp": "^0.35.3"
   },
   "engines": {

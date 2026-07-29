@@ -1,0 +1,10 @@
+[Unit]
+Description=Process incoming MafuSheets backups
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+Unit=mafusheets-backup-receiver.service
+
+[Install]
+WantedBy=timers.target

@@ -172,7 +172,10 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
       THUMB_DIR: thumbnailsPath,
       TMP_DIR: temporaryPath,
       QUARANTINE_DIR: path.join(directory, "quarantine"),
-      SESSION_SECRET: STRONG_SECRET
+      SESSION_SECRET: STRONG_SECRET,
+      REQUIRE_HTTPS: "0",
+      COOKIE_SECURE: "0",
+      PUBLIC_ORIGIN: ""
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -189,11 +192,28 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
   }
   assert.equal(child.exitCode, null, childOutput);
 
-  assert.equal((await api(base, "/api/resources")).response.status, 401);
+  const guestCatalog = await api(base, "/api/resources");
+  assert.equal(guestCatalog.response.status, 200, `${guestCatalog.text}\n${childOutput}`);
+  assert.deepEqual(guestCatalog.body.resources, []);
+  const guestPage = await (await fetch(`${base}/`)).text();
+  assert.match(guestPage, /id="accountButton"/);
+  assert.match(guestPage, />Sign in\s*<\/button>/);
+  assert.equal(guestPage.includes("Sign in / Register"), false);
+  assert.match(guestPage, /id="registerView" hidden/);
+  assert.match(guestPage, /\.admin-stack\[hidden\]\s*\{\s*display: none;/);
+  assert.match(guestPage, /<h2 id="actionsTitle">Sign in<\/h2>/);
+  assert.match(guestPage, /<label>Username\s*<input id="registerLogin"/);
+  assert.match(guestPage, /accountButton\.textContent = authState\.authenticated/);
+  assert.match(guestPage, /onclick="document\.querySelector\('#actionsDialog'\)\.showModal\(\)"/);
+  assert.match(guestPage, /const registerForm = document\.querySelector\("#registerForm"\)/);
+  assert.match(guestPage, /accountButton\.addEventListener\("click"/);
+  assert.match(guestPage, /async function changeResourceVisibility\(\)/);
+  assert.match(guestPage, /loginForm\.addEventListener\('submit'/);
+  assert.match(guestPage, /registerForm\.addEventListener\("submit", registerAccount\)/);
   assert.equal((await login(base, "member@example.test", "WrongPassword2026")).response.status, 401);
 
   const firstMemberLogin = await login(base, "member@example.test", "MemberPassword2026", "mafusheets_admin=fixed");
-  assert.equal(firstMemberLogin.response.status, 200);
+  assert.equal(firstMemberLogin.response.status, 200, JSON.stringify(firstMemberLogin.body));
   assert.notEqual(firstMemberLogin.cookie, "mafusheets_admin=fixed");
   const secondMemberLogin = await login(base, "member@example.test", "MemberPassword2026", firstMemberLogin.cookie);
   assert.notEqual(secondMemberLogin.cookie, firstMemberLogin.cookie);
@@ -202,9 +222,23 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
     cookie: secondMemberLogin.cookie,
     csrf: secondMemberLogin.body.csrfToken
   };
+  assert.equal((await api(base, "/api/account/profile", {
+    method: "PATCH", ...memberAuth,
+    body: { displayName: "Updated Member", currentPassword: "WrongPassword2026" }
+  })).response.status, 400);
+  const profileUpdate = await api(base, "/api/account/profile", {
+    method: "PATCH", ...memberAuth,
+    body: { displayName: "Updated Member", currentPassword: "MemberPassword2026" }
+  });
+  assert.equal(profileUpdate.response.status, 200);
+  assert.equal(profileUpdate.body.user.displayName, "Updated Member");
+  const mine = await api(base, "/api/resources?mine=1", memberAuth);
+  assert.deepEqual(mine.body.resources.map((resource) => resource.id), ["member-resource"]);
+  assert.equal(mine.body.resources[0].uploadedByDisplayName, "Updated Member");
   assert.equal((await api(base, "/api/admin/thumbnails/refresh", {
     method: "POST", ...memberAuth
   })).response.status, 403);
+  assert.equal((await api(base, "/api/admin/users", memberAuth)).response.status, 403);
   assert.equal((await api(base, "/api/resources/other-resource", {
     method: "PATCH", ...memberAuth, body: { title: "Stolen edit" }
   })).response.status, 403);
@@ -228,6 +262,95 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
   )).response.status, 403);
 
   const adminLogin = await login(base, "admin@example.test", "AdminPassword2026");
+  const adminReaderPage = await (await fetch(`${base}/sheets/member-resource`, {
+    headers: { Cookie: adminLogin.cookie }
+  })).text();
+  assert.match(adminReaderPage, /id="visibilityButton"/);
+  assert.match(adminReaderPage, /visibilityButton\.addEventListener\("click", changeResourceVisibility\)/);
+  const memberReaderPage = await (await fetch(`${base}/sheets/member-resource`, {
+    headers: { Cookie: memberAuth.cookie }
+  })).text();
+  assert.doesNotMatch(memberReaderPage, /id="visibilityButton"/);
+  const publish = await api(base, "/api/admin/resources/member-resource/visibility", {
+    method: "PATCH",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: { visibility: "guest" }
+  });
+  assert.equal(publish.response.status, 200);
+  assert.deepEqual(
+    (await api(base, "/api/resources")).body.resources.map((resource) => resource.id),
+    ["member-resource"]
+  );
+  assert.equal((await fetch(`${base}/files/member-resource`)).status, 200);
+  assert.equal((await fetch(`${base}/files/other-resource`)).status, 404);
+  assert.equal((await api(base, `/api/admin/users/${admin.id}`, {
+    method: "PATCH",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: { enabled: false }
+  })).response.status, 400);
+  const sorted = await api(base, "/api/resources?sort=title-desc", {
+    cookie: adminLogin.cookie
+  });
+  assert.deepEqual(sorted.body.resources.map((resource) => resource.title), [
+    "Owned edit", "Other sheet"
+  ]);
+  assert.equal((await api(base, "/api/admin/users", {
+    cookie: adminLogin.cookie
+  })).body.users.length, 3);
+  assert.equal((await api(base, "/api/admin/users", {
+    method: "POST",
+    cookie: adminLogin.cookie,
+    body: {
+      loginIdentifier: "created@example.test",
+      displayName: "Created User",
+      password: "CreatedPassword2026",
+      role: "member"
+    }
+  })).response.status, 403);
+  const createdAccount = await api(base, "/api/admin/users", {
+    method: "POST",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: {
+      loginIdentifier: "created@example.test",
+      displayName: "Created User",
+      password: "CreatedPassword2026",
+      role: "member",
+      mustChangePassword: true
+    }
+  });
+  assert.equal(createdAccount.response.status, 201, createdAccount.text);
+  assert.equal(createdAccount.body.user.mustChangePassword, true);
+  const createdId = createdAccount.body.user.id;
+  const promotedAccount = await api(base, `/api/admin/users/${createdId}`, {
+    method: "PATCH",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: { role: "admin" }
+  });
+  assert.equal(promotedAccount.body.user.role, "admin");
+  const renamedAccount = await api(base, `/api/admin/users/${createdId}`, {
+    method: "PATCH",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: {
+      loginIdentifier: "renamed-created@example.test",
+      displayName: "Renamed Created User"
+    }
+  });
+  assert.equal(renamedAccount.body.user.loginIdentifier, "renamed-created@example.test");
+  const resetAccount = await api(base, `/api/admin/users/${createdId}/reset-password`, {
+    method: "POST",
+    cookie: adminLogin.cookie,
+    csrf: adminLogin.body.csrfToken,
+    body: { password: "ReplacementPassword2026", mustChangePassword: true }
+  });
+  assert.equal(resetAccount.response.status, 200, resetAccount.text);
+  assert.equal((await login(
+    base, "renamed-created@example.test", "ReplacementPassword2026"
+  )).response.status, 200);
   assert.equal((await api(base, "/api/resources/other-resource", {
     method: "PATCH",
     cookie: adminLogin.cookie,
@@ -252,7 +375,10 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
 
   const liveDb = openDatabase(databasePath);
   createUserStore(liveDb).setEnabled(member.id, false, { actorUserId: admin.id });
-  assert.equal((await api(base, "/api/resources", memberAuth)).response.status, 401);
+  assert.deepEqual(
+    (await api(base, "/api/resources", memberAuth)).body.resources.map((resource) => resource.id),
+    ["member-resource"]
+  );
   liveDb.close();
 
   const logout = await api(base, "/api/auth/logout", {
@@ -261,7 +387,7 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
     csrf: adminLogin.body.csrfToken
   });
   assert.equal(logout.response.status, 200);
-  assert.equal((await api(base, "/api/resources", { cookie: adminLogin.cookie })).response.status, 401);
+  assert.equal((await api(base, "/api/resources", { cookie: adminLogin.cookie })).response.status, 200);
 
   const auditDb = openDatabase(databasePath);
   const eventTypes = new Set(
