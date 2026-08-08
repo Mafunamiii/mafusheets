@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { extractSearchText, normalizeSearchText } = require("./search-indexer");
+const { checkConnectivity, listDocuments, getMetadataLookups, getDocumentFile, uploadDocument, updateDocumentMetadata, deleteDocument, PaperlessError } = require("./paperless-client");
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -64,6 +65,7 @@ const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || "";
 const SESSION_COOKIE = "mafusheets_admin";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
+const DOCUMENT_PROVIDER = String(process.env.DOCUMENT_PROVIDER || "local").trim().toLowerCase() === "paperless" ? "paperless" : "local";
 let indexQueue = Promise.resolve();
 const sessions = new Map();
 const authLimiter = rateLimit({
@@ -522,7 +524,9 @@ function publicResource(resource) {
     tags: Array.isArray(resource.tags) ? resource.tags : [],
     annotationsCount: annotationsCount(resource),
     canPreview: canPreview(resource),
-    readerUrl: sheetKind === "pdf" ? `/sheets/${encodeURIComponent(resource.id)}` : "",
+    readerUrl: sheetKind === "pdf"
+      ? `${DOCUMENT_PROVIDER === "paperless" ? "/files" : "/sheets"}/${encodeURIComponent(resource.id)}`
+      : "",
     thumbnailUrl: thumbnailUrl(resource, sheetKind),
     viewUrl: `/files/${encodeURIComponent(resource.id)}`,
     downloadUrl: `/files/${encodeURIComponent(resource.id)}?download=1`
@@ -534,6 +538,26 @@ function fullResource(resource) {
     ...publicResource(resource),
     annotations: Array.isArray(resource.annotations) ? resource.annotations : []
   };
+}
+
+function resolvePaperlessCustomValue(customFields, customFieldByName, name) {
+  const field = customFieldByName.get(name.toLowerCase());
+  const entry = field && customFields.find((item) => String(item.field ?? item.field_id) === String(field.id));
+  const value = entry?.value ?? null;
+  if (value === null || String(field?.data_type || "").toLowerCase() !== "select") {
+    return value;
+  }
+
+  const option = (field.extra_data?.select_options || []).find((item) => String(item.id) === String(value));
+  return option?.label ?? null;
+}
+
+function resolvePaperlessSheetKind(document, fileName, documentTypeNames) {
+  if (document.document_type !== null && document.document_type !== undefined && document.document_type !== "") {
+    return documentTypeNames.get(String(document.document_type)) || "other";
+  }
+
+  return sheetKindForExtension(fileName ? path.extname(fileName).toLowerCase() : null);
 }
 
 function resourceMatchesQuery(resource, query) {
@@ -556,6 +580,28 @@ function resourceMatchesQuery(resource, query) {
     Array.isArray(resource.tags) ? resource.tags.join(" ") : "",
     annotations.map((annotation) => annotation.text).join(" "),
     resource.searchText
+  ]
+    .filter(Boolean)
+    .some((value) => normalizeSearchText(value).includes(normalizedQuery));
+}
+
+function resourceMatchesPaperlessMetadata(resource, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) {
+    return true;
+  }
+
+  return [
+    resource.title,
+    resource.artist,
+    resource.key,
+    resource.capo,
+    resource.bpm,
+    resource.notes,
+    resource.originalName,
+    resource.category,
+    resource.extension,
+    Array.isArray(resource.tags) ? resource.tags.join(" ") : ""
   ]
     .filter(Boolean)
     .some((value) => normalizeSearchText(value).includes(normalizedQuery));
@@ -695,6 +741,192 @@ app.get("/api/auth/me", (req, res) => {
   });
 });
 
+app.get("/api/admin/paperless", requireAdmin, async (_req, res) => {
+  try {
+    return res.json(await checkConnectivity());
+  } catch (error) {
+    if (error instanceof PaperlessError) {
+      return res.status(502).json({
+        configured: true,
+        reachable: false,
+        apiWorking: false,
+        error: error.message,
+        code: error.code
+      });
+    }
+
+    console.error("Paperless connectivity check failed:", error.message);
+    return res.status(502).json({
+      configured: true,
+      reachable: false,
+      apiWorking: false,
+      error: "Paperless connectivity check failed."
+    });
+  }
+});
+
+app.get("/api/admin/paperless/documents", requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(req.query.page_size, 10) || 25));
+    const result = await listDocuments({ page, pageSize });
+    const documents = Array.isArray(result.results) ? result.results : [];
+    const lookups = await getMetadataLookups();
+    const byId = (items) => new Map(items.map((item) => [String(item.id), item.name]));
+    const correspondentNames = byId(lookups.correspondents);
+    const tagNames = byId(lookups.tags);
+    const documentTypeNames = byId(lookups.documentTypes);
+    const customFieldByName = new Map(lookups.customFields.map((field) => [field.name.toLowerCase(), field]));
+    const mapPaperlessDocument = (document) => {
+      const customFields = Array.isArray(document.custom_fields) ? document.custom_fields : [];
+      const fileName = document.archived_file_name || document.document_file_name || document.original_file_name || null;
+      return {
+        id: `paperless-${document.id}`,
+        paperlessId: document.id,
+        title: document.title || document.original_file_name || "Untitled document",
+        artist: correspondentNames.get(String(document.correspondent)) || null,
+        key: resolvePaperlessCustomValue(customFields, customFieldByName, "Key"),
+        capo: resolvePaperlessCustomValue(customFields, customFieldByName, "Capo"),
+        bpm: resolvePaperlessCustomValue(customFields, customFieldByName, "BPM"),
+        notes: resolvePaperlessCustomValue(customFields, customFieldByName, "Notes"),
+        tags: Array.isArray(document.tags) ? document.tags.map((id) => tagNames.get(String(id))).filter(Boolean) : [],
+        category: "documents",
+        sheetKind: resolvePaperlessSheetKind(document, fileName, documentTypeNames),
+        originalName: document.original_file_name || fileName,
+        storedName: null,
+        extension: fileName ? path.extname(fileName).toLowerCase() : null,
+        size: document.document_file_size ?? document.archive_file_size ?? null,
+        uploadedAt: document.added || null,
+        annotations: []
+      };
+    };
+
+    return res.json({
+      count: result.count ?? null,
+      next: result.next ?? null,
+      previous: result.previous ?? null,
+      page,
+      pageSize,
+      resources: documents.map(mapPaperlessDocument)
+    });
+  } catch (error) {
+    if (error instanceof PaperlessError) {
+      return res.status(502).json({
+        error: error.message,
+        code: error.code
+      });
+    }
+    console.error("Paperless document listing failed:", error.message);
+    return res.status(502).json({ error: "Paperless document listing failed." });
+  }
+});
+
+async function readPaperlessResources({ query = "" } = {}) {
+  const normalizedQuery = String(query).trim();
+  const documents = [];
+  const metadataDocuments = [];
+  let page = 1;
+  let result;
+  do {
+    result = await listDocuments({ page, pageSize: 100, query: normalizedQuery });
+    if (Array.isArray(result.results)) documents.push(...result.results);
+    page += 1;
+  } while (result.next);
+
+  let total = result?.count;
+  if (normalizedQuery) {
+    // Paperless remains the canonical full-text/title search. This second,
+    // paginated API read is only for legacy MafuSheets metadata substring
+    // matching; it never reads or searches document content locally.
+    page = 1;
+    do {
+      result = await listDocuments({ page, pageSize: 100 });
+      if (Array.isArray(result.results)) metadataDocuments.push(...result.results);
+      page += 1;
+    } while (result.next);
+    total = result?.count;
+  }
+
+  const lookups = await getMetadataLookups();
+  const byId = (items) => new Map((Array.isArray(items) ? items : []).map((item) => [String(item.id), item.name]));
+  const correspondentNames = byId(lookups.correspondents);
+  const tagNames = byId(lookups.tags);
+  const documentTypeNames = byId(lookups.documentTypes);
+  const customFieldByName = new Map((Array.isArray(lookups.customFields) ? lookups.customFields : []).map((field) => [String(field.name || "").toLowerCase(), field]));
+
+  const mapDocument = (document) => {
+    const customFields = Array.isArray(document.custom_fields) ? document.custom_fields : [];
+    const fileName = document.archived_file_name || document.document_file_name || document.original_file_name || null;
+    return {
+      id: `paperless-${document.id}`,
+      paperlessId: document.id,
+      title: document.title || document.original_file_name || "Untitled document",
+      artist: correspondentNames.get(String(document.correspondent)) || null,
+      key: resolvePaperlessCustomValue(customFields, customFieldByName, "Key"),
+      capo: resolvePaperlessCustomValue(customFields, customFieldByName, "Capo"),
+      bpm: resolvePaperlessCustomValue(customFields, customFieldByName, "BPM"),
+      notes: resolvePaperlessCustomValue(customFields, customFieldByName, "Notes"),
+      tags: Array.isArray(document.tags) ? document.tags.map((id) => tagNames.get(String(id))).filter(Boolean) : [],
+      category: "documents", sheetKind: resolvePaperlessSheetKind(document, fileName, documentTypeNames),
+      originalName: document.original_file_name || fileName, storedName: null,
+      extension: fileName ? path.extname(fileName).toLowerCase() : null,
+      size: document.document_file_size ?? document.archive_file_size ?? null,
+      uploadedAt: document.added || null, annotations: []
+    };
+  };
+
+  const byPaperlessId = new Map(documents.map((document) => [String(document.id), mapDocument(document)]));
+  for (const document of metadataDocuments) {
+    const resource = mapDocument(document);
+    if (resourceMatchesPaperlessMetadata(resource, normalizedQuery)) {
+      byPaperlessId.set(String(document.id), resource);
+    }
+  }
+
+  const resources = [...byPaperlessId.values()];
+  resources.total = total;
+  return resources;
+}
+
+async function getPaperlessResourceCount() {
+  const result = await listDocuments({ page: 1, pageSize: 1 });
+  return Number.isInteger(result.count) ? result.count : 0;
+}
+
+async function readResourceProvider() {
+  return DOCUMENT_PROVIDER === "paperless" ? readPaperlessResources() : readIndex();
+}
+
+function safeUpstreamFilename(value, fallback) {
+  const name = String(value || fallback).replace(/[\r\n\\/"\u0000-\u001f]/g, "_").trim();
+  return name.slice(0, 180) || fallback;
+}
+
+async function proxyPaperlessFile(req, res, kind) {
+  try {
+    const response = await getDocumentFile(req.params.id, { kind });
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
+    const safeType = contentType.toLowerCase().startsWith("text/html") ? "application/octet-stream" : contentType;
+    const filename = safeUpstreamFilename(response.headers.get("content-disposition")?.match(/filename="?([^";]+)"?/i)?.[1], `paperless-${req.params.id}`);
+    res.status(response.status).setHeader("Content-Type", safeType);
+    res.setHeader("Content-Disposition", `${kind === "thumbnail" || kind === "preview" ? "inline" : "attachment"}; filename="${filename}"`);
+    const length = response.headers.get("content-length");
+    if (length) res.setHeader("Content-Length", length);
+    return require("stream").Readable.fromWeb(response.body).pipe(res);
+  } catch (error) {
+    if (error instanceof PaperlessError) {
+      return res.status(error.status && error.status >= 400 && error.status < 500 ? error.status : 502).json({ error: error.message, code: error.code });
+    }
+    console.error("Paperless file proxy failed:", error.message);
+    return res.status(502).json({ error: "Paperless file delivery failed." });
+  }
+}
+
+app.get("/api/admin/paperless/documents/:id/original", requireAdmin, (req, res) => proxyPaperlessFile(req, res, "original"));
+app.get("/api/admin/paperless/documents/:id/archive", requireAdmin, (req, res) => proxyPaperlessFile(req, res, "archive"));
+app.get("/api/admin/paperless/documents/:id/preview", requireAdmin, (req, res) => proxyPaperlessFile(req, res, "preview"));
+app.get("/api/admin/paperless/documents/:id/thumbnail", requireAdmin, (req, res) => proxyPaperlessFile(req, res, "thumbnail"));
+
 app.post("/api/auth/login", authLimiter, requireSameOrigin, async (req, res) => {
   const username = cleanText(req.body.username, 64);
   const password = String(req.body.password || "");
@@ -717,24 +949,44 @@ app.post("/api/auth/logout", requireAdmin, requireSameOrigin, requireCsrf, (req,
 app.get("/api/resources", requireAdmin, async (req, res) => {
   const activeKind = String(req.query.kind || "all").trim().toLowerCase();
   const query = String(req.query.q || "");
-  const resources = await readIndex();
+  let resources;
+  let total;
+  let count;
+  try {
+    if (DOCUMENT_PROVIDER === "paperless") {
+      resources = await readPaperlessResources({ query });
+      total = resources.total;
+    } else {
+      resources = await readIndex();
+    }
+  } catch (error) {
+    if (error instanceof PaperlessError) {
+      const status = error.status === 403 ? 403 : 502;
+      return res.status(status).json({
+        error: status === 403 ? "Paperless refused the search request." : error.message,
+        code: error.code
+      });
+    }
+    throw error;
+  }
   const filtered = resources.filter((resource) => {
     const kind = resource.sheetKind || sheetKindForExtension(resource.extension);
     const inKind = activeKind === "all" || kind === activeKind;
-    return inKind && resourceMatchesQuery(resource, query);
+    return inKind && (DOCUMENT_PROVIDER === "paperless" || resourceMatchesQuery(resource, query));
   });
 
   filtered.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
 
+  count = filtered.length;
   res.json({
-    total: resources.length,
-    count: filtered.length,
+    total: total ?? resources.length,
+    count,
     resources: filtered.map(publicResource)
   });
 });
 
 app.get("/api/resources/:id", requireAdmin, async (req, res) => {
-  const resources = await readIndex();
+  const resources = await readResourceProvider();
   const resource = getResourceById(resources, req.params.id);
 
   if (!resource) {
@@ -754,6 +1006,35 @@ app.patch("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, as
   };
   const capo = cleanNumber(req.body.capo, { min: 0, max: 24 });
   const bpm = cleanNumber(req.body.bpm, { min: 20, max: 400 });
+
+  if (DOCUMENT_PROVIDER === "paperless") {
+    const match = /^paperless-(\d+)$/.exec(String(req.params.id || ""));
+    if (!match) return res.status(404).json({ error: "Sheet not found." });
+    if (!updates.title) return res.status(400).json({ error: "A title is required." });
+
+    try {
+      const lookups = await getMetadataLookups();
+      await updateDocumentMetadata({
+        documentId: match[1], ...updates, capo, bpm,
+        sheetKind: cleanText(req.body.sheetKind, 24),
+        lookups, updateSheetKind: Object.prototype.hasOwnProperty.call(req.body, "sheetKind")
+      });
+      const resource = (await readPaperlessResources()).find((item) => item.id === req.params.id);
+      if (!resource) return res.status(404).json({ error: "Sheet not found." });
+      return res.json({ resource: fullResource(resource) });
+    } catch (error) {
+      if (error instanceof PaperlessError) {
+        const response = { error: error.message, code: error.code };
+        if (process.env.NODE_ENV !== "production" && process.env.PAPERLESS_DEBUG === "true" && error.details) {
+          response.paperlessValidation = error.details;
+          console.error("Paperless metadata validation response:", JSON.stringify(error.details));
+        }
+        return res.status(error.status && error.status >= 400 && error.status < 500 ? error.status : 502).json(response);
+      }
+      console.error("Paperless document update failed:", error.message);
+      return res.status(502).json({ error: "Paperless document update failed." });
+    }
+  }
 
   await updateIndex((resources) => {
     const resource = getResourceById(resources, req.params.id);
@@ -797,6 +1078,27 @@ app.delete("/api/resources/:id", requireAdmin, requireSameOrigin, requireCsrf, a
 
   if (deleteCode !== DELETE_CODE) {
     return res.status(403).json({ error: "Invalid delete confirmation code." });
+  }
+
+  if (DOCUMENT_PROVIDER === "paperless") {
+    const match = /^paperless-(\d+)$/.exec(String(req.params.id || ""));
+    const paperlessId = match ? Number(match[1]) : NaN;
+    if (!Number.isSafeInteger(paperlessId) || paperlessId < 1) {
+      return res.status(404).json({ error: "Sheet not found." });
+    }
+
+    try {
+      await deleteDocument({ documentId: paperlessId });
+      return res.json({ ok: true });
+    } catch (error) {
+      if (error instanceof PaperlessError) {
+        if (error.status === 404) return res.status(404).json({ error: "Sheet not found." });
+        const status = error.status === 403 ? 403 : 502;
+        return res.status(status).json({ error: error.status === 403 ? "Paperless refused the delete request." : error.message, code: error.code });
+      }
+      console.error("Paperless document deletion failed:", error.message);
+      return res.status(502).json({ error: "Paperless document deletion failed." });
+    }
   }
 
   let deletedResource = null;
@@ -944,6 +1246,27 @@ app.post("/api/upload", uploadLimiter, requireAdmin, requireSameOrigin, requireC
   const created = [];
 
   try {
+    if (DOCUMENT_PROVIDER === "paperless") {
+      const lookups = await getMetadataLookups();
+      for (const file of files) {
+        const extension = path.extname(file.originalname).toLowerCase();
+        const documentTitle = files.length === 1 ? title : `${title} - ${file.originalname}`;
+        const result = await uploadDocument({
+          filePath: file.path, filename: file.originalname, contentType: file.mimetype,
+          title: documentTitle, artist, tags, sheetKind: kind, key, capo, bpm, notes, lookups
+        });
+        const paperlessId = result.id || result.document_id || result.task_id;
+        created.push({
+          id: paperlessId ? `paperless-${paperlessId}` : `paperless-upload-${crypto.randomUUID()}`,
+          paperlessId: result.id || result.document_id || null, title: documentTitle, artist, key, capo, bpm, notes, tags,
+          category: "documents", sheetKind: sheetKindForExtension(extension), originalName: file.originalname,
+          storedName: null, extension, size: file.size, uploadedAt, annotations: []
+        });
+      }
+      await removeTempFiles(files);
+      return res.status(201).json({ resources: created.map(publicResource) });
+    }
+
     for (const file of files) {
       const extension = path.extname(file.originalname).toLowerCase();
       const id = crypto.randomUUID();
@@ -1041,7 +1364,7 @@ app.get("/sheets/:id", requireAdmin, async (req, res) => {
 });
 
 app.get("/thumbnails/:id.png", requireAdmin, async (req, res) => {
-  const resources = await readIndex();
+  const resources = await readResourceProvider();
   const resource = getResourceById(resources, req.params.id);
 
   if (!resource) {
@@ -1049,6 +1372,10 @@ app.get("/thumbnails/:id.png", requireAdmin, async (req, res) => {
   }
 
   try {
+    if (DOCUMENT_PROVIDER === "paperless") {
+      return proxyPaperlessFile({ params: { id: resource.paperlessId } }, res, "thumbnail");
+    }
+
     if (resource.extension === ".pdf") {
       const thumbnailPath = await ensurePdfThumbnail(resource);
       if (!thumbnailPath) {
@@ -1077,11 +1404,15 @@ app.get("/thumbnails/:id.png", requireAdmin, async (req, res) => {
 });
 
 app.get("/files/:id", requireAdmin, async (req, res) => {
-  const resources = await readIndex();
+  const resources = await readResourceProvider();
   const resource = resources.find((item) => item.id === req.params.id);
 
   if (!resource) {
     return res.status(404).send("File not found.");
+  }
+
+  if (DOCUMENT_PROVIDER === "paperless") {
+    return proxyPaperlessFile({ params: { id: resource.paperlessId } }, res, req.query.download ? "original" : "preview");
   }
 
   const resolved = resolveResourceFile(resource);
@@ -3291,6 +3622,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
       state.resources = result.resources || [];
       state.total = result.total || 0;
       render();
+      return result;
     }
 
     function render() {
@@ -3306,9 +3638,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         const preview = resource.thumbnailUrl
           ? '<img class="' + (resource.sheetKind === "pdf" ? "pdf-thumb" : resource.sheetKind === "image" ? "image-thumb" : "") + '" src="' + resource.thumbnailUrl + '" alt="">'
           : '<div class="filemark">' + escapeHtml((kindLabels[resource.sheetKind] || resource.extension.replace(".", "")).toUpperCase()) + '</div>';
-        const previewWrap = resource.sheetKind === "pdf" && resource.readerUrl
-          ? '<a class="preview" href="' + resource.readerUrl + '">' + preview + '</a>'
-          : '<button class="preview" type="button" data-open="' + resource.id + '">' + preview + '</button>';
+        const previewWrap = '<button class="preview" type="button" data-open="' + resource.id + '">' + preview + '</button>';
         const openAction = resource.sheetKind === "pdf" && resource.readerUrl
           ? '<a class="action" href="' + resource.readerUrl + '">Open</a>'
           : '<button class="action" type="button" data-open="' + resource.id + '">Open</button>';
@@ -3355,6 +3685,36 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
     }
 
     const debouncedLoadResources = debounce(loadResources, 220);
+
+    async function refreshResourcesAfterUpload(uploadedResources) {
+      const initialTotal = state.total;
+      const paperlessUpload = uploadedResources.some(function(resource) {
+        return String(resource.id || "").startsWith("paperless-");
+      });
+
+      const isUploadedResourceVisible = function(result) {
+        const resources = result.resources || [];
+        return uploadedResources.some(function(uploaded) {
+          return resources.some(function(resource) {
+            return resource.id === uploaded.id ||
+              (resource.title === uploaded.title && resource.originalName === uploaded.originalName);
+          });
+        });
+      };
+
+      let result = await loadResources();
+      if (!paperlessUpload || result.total > initialTotal || isUploadedResourceVisible(result)) {
+        return;
+      }
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await new Promise(function(resolve) { setTimeout(resolve, 1500); });
+        result = await loadResources();
+        if (result.total > initialTotal || isUploadedResourceVisible(result)) {
+          return;
+        }
+      }
+    }
 
     async function openSheet(id) {
       activeDetailId = id;
@@ -3829,7 +4189,7 @@ function renderMainHtml({ authenticated = false, csrfToken = "", username = "" }
         kindInput.value = 'pdf';
         updateFileAccept();
         setMessage('Upload complete.', 'ok');
-        await loadResources();
+        await refreshResourcesAfterUpload(result.resources || []);
       } catch (error) {
         setMessage(error.message, 'error');
       } finally {
