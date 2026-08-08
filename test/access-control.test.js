@@ -75,7 +75,7 @@ test("unsafe session secrets are rejected", () => {
 test("server startup fails when the session secret is empty", async () => {
   const child = spawn(process.execPath, ["server.js"], {
     cwd: path.join(__dirname, ".."),
-    env: { ...process.env, SESSION_SECRET: "" },
+    env: { ...process.env, LOAD_ENV_FILE: "0", SESSION_SECRET: "" },
     stdio: ["ignore", "ignore", "pipe"]
   });
   let stderr = "";
@@ -139,6 +139,9 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
       uploadedAt: new Date().toISOString(),
       uploadedBy: member.id,
       updatedBy: member.id,
+      searchText: "opening verse concealed coda",
+      searchPages: ["opening verse", "concealed coda"],
+      searchStatus: "indexed",
       annotations: []
     },
     {
@@ -164,6 +167,7 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
     cwd: path.join(__dirname, ".."),
     env: {
       ...process.env,
+      LOAD_ENV_FILE: "0",
       HOST: "127.0.0.1",
       PORT: String(port),
       DATABASE_PATH: databasePath,
@@ -222,6 +226,13 @@ test("HTTP access control, session lifecycle, ownership, and audit enforcement",
     cookie: secondMemberLogin.cookie,
     csrf: secondMemberLogin.body.csrfToken
   };
+  const pageMatch = await api(base, "/api/resources?q=concealed%20coda", memberAuth);
+  assert.equal(pageMatch.response.status, 200, pageMatch.text);
+  assert.deepEqual(pageMatch.body.resources.map((resource) => ({
+    id: resource.id, matchedPage: resource.matchedPage
+  })), [{ id: "member-resource", matchedPage: 2 }]);
+  assert.equal("searchPages" in pageMatch.body.resources[0], false);
+  assert.equal("searchText" in pageMatch.body.resources[0], false);
   assert.equal((await api(base, "/api/account/profile", {
     method: "PATCH", ...memberAuth,
     body: { displayName: "Updated Member", currentPassword: "WrongPassword2026" }

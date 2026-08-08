@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "reindex": "node reindex.js",
+    "reindex:all": "node reindex.js --all",
     "integrity": "node lib/integrity.js",
     "account": "node lib/bootstrap.js",
     "backup": "node scripts/release-data.js backup",

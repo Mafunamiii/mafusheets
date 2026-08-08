@@ -238,6 +238,7 @@ For a deliberate remote update:
 After startup, verify the deployed endpoint:
 
 ```bash
+docker compose exec mafusheets npm run reindex:all # required once for page-aware PDF search
 curl -I http://HOST/                         # 308 to https://
 curl -k https://HOST/health                  # 200
 docker compose ps                            # app and nginx healthy
@@ -246,6 +247,10 @@ docker compose exec mafusheets sh -c 'test ! -w /app/server.js'
 docker compose exec mafusheets wget -qO- http://127.0.0.1:3000/ready
 ./scripts/verify-running.sh
 ```
+
+The schema migration preserves existing search data, but it cannot reconstruct which PDF page
+contained each term. Run `reindex:all` once after deploying schema version 7 so existing PDFs gain
+page-level search results; newly uploaded PDFs are indexed page-by-page automatically.
 
 Confirm from a separate host that only the configured nginx ports are reachable; port 3000 must
 not be reachable. Test login through HTTPS and inspect `Set-Cookie` for `Secure`, `HttpOnly`,

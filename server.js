@@ -59,7 +59,9 @@ function loadEnvFile(filePath) {
   }
 }
 
-loadEnvFile(path.join(__dirname, ".env"));
+if (process.env.LOAD_ENV_FILE !== "0") {
+  loadEnvFile(path.join(__dirname, ".env"));
+}
 process.umask(0o077);
 
 const app = express();
@@ -698,6 +700,7 @@ function annotationsCount(resource) {
 function publicResource(resource) {
   const safeResource = { ...resource };
   delete safeResource.searchText;
+  delete safeResource.searchPages;
   delete safeResource.storedName;
   delete safeResource.annotations;
   const sheetKind = resource.sheetKind || sheetKindForExtension(resource.extension);
@@ -729,14 +732,18 @@ function guestResource(resource) {
   return safe;
 }
 
-function resourceMatchesQuery(resource, query) {
+function resourceQueryMatch(resource, query) {
   const normalizedQuery = normalizeSearchText(query);
   if (!normalizedQuery) {
-    return true;
+    return { matches: true, page: null };
   }
 
   const annotations = Array.isArray(resource.annotations) ? resource.annotations : [];
-  return [
+  const matchingAnnotation = annotations.find((annotation) =>
+    normalizeSearchText(annotation.text).includes(normalizedQuery)
+  );
+  if (matchingAnnotation) return { matches: true, page: matchingAnnotation.page };
+  const metadataMatches = [
     resource.title,
     resource.artist,
     resource.key,
@@ -746,12 +753,18 @@ function resourceMatchesQuery(resource, query) {
     resource.originalName,
     resource.category,
     resource.extension,
-    Array.isArray(resource.tags) ? resource.tags.join(" ") : "",
-    annotations.map((annotation) => annotation.text).join(" "),
-    resource.searchText
+    Array.isArray(resource.tags) ? resource.tags.join(" ") : ""
   ]
     .filter(Boolean)
     .some((value) => normalizeSearchText(value).includes(normalizedQuery));
+  if (metadataMatches) return { matches: true, page: null };
+  const pageIndex = (Array.isArray(resource.searchPages) ? resource.searchPages : [])
+    .findIndex((value) => normalizeSearchText(value).includes(normalizedQuery));
+  if (pageIndex >= 0) return { matches: true, page: pageIndex + 1 };
+  return {
+    matches: normalizeSearchText(resource.searchText).includes(normalizedQuery),
+    page: null
+  };
 }
 
 function getResourceById(resources, id) {
@@ -942,7 +955,8 @@ async function executeProcessingJob(job) {
     }, PROCESS_TIMEOUT_MS);
     const committed = resourceStore.updateSearchIndex(
       resource.id, resource.updatedAt,
-      { searchText: result.searchText, searchStatus: result.searchStatus },
+      { searchText: result.searchText, searchPages: result.searchPages,
+        searchStatus: result.searchStatus },
       job.actor_user_id
     );
     if (!committed) {
@@ -1206,11 +1220,14 @@ app.get("/api/resources", async (req, res) => {
   const resources = allResources.filter((resource) =>
     canViewResource(resource, req.adminSession)
   );
+  const matches = new Map();
   const filtered = resources.filter((resource) => {
     const kind = resource.sheetKind || sheetKindForExtension(resource.extension);
     const inKind = activeKind === "all" || kind === activeKind;
-    return inKind && (!mineOnly || resource.uploadedBy === req.adminSession?.userId) &&
-      resourceMatchesQuery(resource, query);
+    if (!inKind || (mineOnly && resource.uploadedBy !== req.adminSession?.userId)) return false;
+    const match = resourceQueryMatch(resource, query);
+    matches.set(resource.id, match);
+    return match.matches;
   });
 
   const titleOrder = (a, b) => String(a.title || "").localeCompare(
@@ -1232,7 +1249,8 @@ app.get("/api/resources", async (req, res) => {
       ...(req.adminSession && (req.adminSession.role === "admin" || req.adminSession.approved)
         ? { uploadedByDisplayName:
             userStore.getUserById(resource.uploadedBy)?.displayName || "Unknown user" }
-        : {})
+        : {}),
+      ...(matches.get(resource.id)?.page ? { matchedPage: matches.get(resource.id).page } : {})
     }))
   });
 });
@@ -2309,6 +2327,9 @@ function renderReaderHtml(
     const annotationTextInput = document.querySelector("#annotationTextInput");
     const annotationColorInput = document.querySelector("#annotationColorInput");
     const annotationList = document.querySelector("#annotationList");
+    const requestedPage = Math.max(1, Number.parseInt(
+      new URLSearchParams(window.location.search).get("page") || "1", 10
+    ) || 1);
     let resource = null;
     let renderedPdfUrl = "";
 
@@ -2331,6 +2352,7 @@ function renderReaderHtml(
           });
           const canvas = document.createElement("canvas");
           canvas.className = "pdf-page";
+          canvas.dataset.page = String(pageNumber);
           canvas.width = Math.floor(viewport.width);
           canvas.height = Math.floor(viewport.height);
           canvas.style.aspectRatio = String(viewport.width) + " / " + String(viewport.height);
@@ -2338,6 +2360,8 @@ function renderReaderHtml(
           mobilePdf.appendChild(canvas);
           await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
         }
+        const requestedCanvas = mobilePdf.querySelector('[data-page="' + String(requestedPage) + '"]');
+        if (requestedCanvas) requestedCanvas.scrollIntoView({ block: "start" });
       } catch (_error) {
         renderedPdfUrl = "";
         pdfStatus.textContent = "This PDF could not be displayed here. Use Open in new tab or Download.";
@@ -2451,10 +2475,11 @@ function renderReaderHtml(
       document.title = (item.title || "Sheet") + " - MafuSheets";
       readerTitle.textContent = item.title || "Sheet";
       readerMeta.textContent = metaLine(item);
-      rawPdfLink.href = item.viewUrl;
+      const pageUrl = item.viewUrl + (requestedPage > 1 ? "#page=" + String(requestedPage) : "");
+      rawPdfLink.href = pageUrl;
       downloadLink.href = item.downloadUrl;
-      if (pdfFrame.src !== item.viewUrl) {
-        pdfFrame.src = item.viewUrl;
+      if (pdfFrame.src !== pageUrl) {
+        pdfFrame.src = pageUrl;
       }
       renderMobilePdf(item.viewUrl);
       fillForm(item);
@@ -4624,6 +4649,8 @@ function renderMainHtml({
       }
 
       resourceGrid.innerHTML = state.resources.map(function(resource) {
+        const readerUrl = resource.readerUrl + (resource.matchedPage
+          ? "?page=" + encodeURIComponent(resource.matchedPage) : "");
         const thumbnailStatus = resource.thumbnailStatus || (resource.thumbnail && resource.thumbnail.status) || "";
         const thumbnailReady = resource.thumbnailUrl && (!thumbnailStatus || thumbnailStatus === "ready");
         const placeholderLabel = thumbnailStatus === "pending" || thumbnailStatus === "processing"
@@ -4636,10 +4663,11 @@ function renderMainHtml({
           : '<div class="thumbnail-placeholder">' + escapeHtml(placeholderLabel) + '</div>';
         const previewWrap = state.viewMode === "list" ? "" :
           (resource.sheetKind === "pdf" && resource.readerUrl
-            ? '<a class="preview" href="' + resource.readerUrl + '">' + preview + '</a>'
+            ? '<a class="preview" href="' + readerUrl + '">' + preview + '</a>'
             : '<button class="preview" type="button" data-open="' + resource.id + '">' + preview + '</button>');
         const openAction = resource.sheetKind === "pdf" && resource.readerUrl
-          ? '<a class="action" href="' + resource.readerUrl + '">Open</a>'
+          ? '<a class="action" href="' + readerUrl + '">Open' +
+            (resource.matchedPage ? ' page ' + escapeHtml(resource.matchedPage) : '') + '</a>'
           : '<button class="action" type="button" data-open="' + resource.id + '">Open</button>';
         const previewAction = resource.canPreview
           ? '<a class="action" href="' + resource.viewUrl + '" target="_blank" rel="noopener">Preview</a>'

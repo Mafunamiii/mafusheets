@@ -52,7 +52,12 @@ test("clean database initialization enables schema and foreign keys", async (t) 
   const result = await migrateLegacyCatalog(db, catalogPath);
   assert.equal(result.status, "initialized-empty");
   assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
-  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 6);
+  assert.equal(db.prepare("SELECT MAX(version) version FROM schema_migrations").get().version, 7);
+  assert.deepEqual(db.prepare("PRAGMA table_info(resources)").all()
+    .filter((column) => column.name === "search_pages_json")
+    .map((column) => ({ notnull: column.notnull, default: column.dflt_value })), [
+    { notnull: 1, default: "'[]'" }
+  ]);
   assert.equal(createCatalogStore(db).listResources().length, 0);
 });
 

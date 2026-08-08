@@ -43,6 +43,7 @@ async function startProductionServer(t) {
     cwd: ROOT,
     env: {
       ...process.env,
+      LOAD_ENV_FILE: "0",
       NODE_ENV: "production",
       HOST: "127.0.0.1",
       PORT: String(port),
@@ -57,7 +58,9 @@ async function startProductionServer(t) {
       REQUIRE_HTTPS: "1",
       COOKIE_SECURE: "1",
       PUBLIC_ORIGIN: "https://sheets.example.test",
-      TRUST_PROXY: "loopback"
+      TRUST_PROXY: "loopback",
+      PDFINFO_BIN: path.join(ROOT, "test/fixtures/pdfinfo"),
+      PDFTOPPM_BIN: path.join(ROOT, "test/fixtures/pdftoppm")
     },
     stdio: ["ignore", "pipe", "pipe"]
   });

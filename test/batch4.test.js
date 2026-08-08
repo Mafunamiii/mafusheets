@@ -161,6 +161,7 @@ test("HTTP uploads reject size, count, quota, forgery, traversal, partial batche
     cwd: path.join(__dirname, ".."),
     env: {
       ...process.env,
+      LOAD_ENV_FILE: "0",
       HOST: "127.0.0.1",
       PORT: String(port),
       DATABASE_PATH: databasePath,

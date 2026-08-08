@@ -25,6 +25,8 @@ done
   exit 1
 }
 
+npm run validate
+grep -F 'return 308 https://$host$request_uri;' nginx/nginx.conf >/dev/null
 docker compose config --quiet
 docker build --check .
 docker build --check nginx

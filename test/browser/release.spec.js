@@ -106,6 +106,19 @@ test("mobile PDF reader scrolls all pages and spaces actions", async ({ page }, 
   await expect(page.locator(".pdf-page").last()).toBeInViewport();
 });
 
+test("page-aware search opens a PDF at the matching page", async ({ page }) => {
+  await login(page);
+  await page.getByLabel("Search sheets").fill("hidden refrain");
+  const result = page.locator('[data-resource-id="pdf-sheet"]');
+  await expect(result).toBeVisible();
+  const open = result.getByRole("link", { name: "Open page 2" });
+  await expect(open).toHaveAttribute("href", "/sheets/pdf-sheet?page=2");
+  await open.click();
+  await expect(page).toHaveURL(/\/sheets\/pdf-sheet\?page=2$/);
+  await expect(page.getByRole("link", { name: "Open in new tab" }))
+    .toHaveAttribute("href", /\/api\/resources\/pdf-sheet\/view#page=2$/);
+});
+
 test("admin can download an uploaded-files backup", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium-desktop", "backup flow runs once");
   await login(page, "admin@example.test", "AdminPassword2026");

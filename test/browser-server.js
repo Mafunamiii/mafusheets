@@ -86,7 +86,8 @@ async function main() {
       id: "pdf-sheet", title: "Two page PDF", artist: "Test", category: "documents",
       sheetKind: "pdf", originalName: "two-pages.pdf", storedName: "two-pages.pdf",
       extension: ".pdf", size: twoPagePdf().length, uploadedAt: timestamp, uploadedBy: admin.id,
-      updatedBy: admin.id, searchStatus: "ready", searchText: "two page pdf", annotations: []
+      updatedBy: admin.id, searchStatus: "ready", searchText: "first verse hidden refrain",
+      searchPages: ["first verse", "hidden refrain"], annotations: []
     }
   ], admin.id);
   db.close();
@@ -107,6 +108,7 @@ async function main() {
     cwd: ROOT,
     env: {
       ...process.env,
+      LOAD_ENV_FILE: "0",
       NODE_ENV: "test",
       HOST: "127.0.0.1",
       PORT: String(PORT),

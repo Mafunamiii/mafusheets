@@ -50,14 +50,27 @@ async function extractPlainTextFile(filePath) {
   return raw;
 }
 
+async function extractPdfPageText(pageData, pages) {
+  const content = await pageData.getTextContent();
+  const pageText = content.items.map((item) => item.str || "").join(" ");
+  const pageNumber = Number(pageData.pageNumber) || pages.length + 1;
+  pages[pageNumber - 1] = normalizeSearchText(pageText);
+  return pageText;
+}
+
 async function extractSearchText(filePath, extension) {
   try {
     let text = "";
+    let searchPages = [];
 
     if (extension === ".pdf") {
       const buffer = await fsp.readFile(filePath);
-      const parsed = await pdfParse(buffer);
+      const pages = [];
+      const parsed = await pdfParse(buffer, {
+        pagerender: (pageData) => extractPdfPageText(pageData, pages)
+      });
       text = parsed.text || "";
+      searchPages = pages.map((page) => page || "");
     } else if (extension === ".docx") {
       const result = await mammoth.extractRawText({ path: filePath });
       text = result.value || "";
@@ -69,18 +82,21 @@ async function extractSearchText(filePath, extension) {
 
     return {
       searchText: normalizeSearchText(text),
+      searchPages,
       searchStatus: text ? "indexed" : "empty"
     };
   } catch (error) {
     console.warn(`Search indexing failed for ${path.basename(filePath)}: ${error.message}`);
     return {
       searchText: "",
+      searchPages: [],
       searchStatus: "failed"
     };
   }
 }
 
 module.exports = {
+  extractPdfPageText,
   extractSearchText,
   normalizeSearchText
 };
